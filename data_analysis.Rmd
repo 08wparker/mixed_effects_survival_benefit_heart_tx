@@ -1,0 +1,2228 @@
+---
+title: Model Fitting and Analysis for "Association of transplant center with survival benefit among adults undergoing heart transplantation in the United States"
+author: William F. Parker MD, MS, Allen S. Anderson MD, Robert D. Gibbons PhD, Edward
+  R Garrity Jr MD, Lainie F Ross, Elbert S. Huang MD, and Matthew M. Churpek MD, PhD
+date: 10/1/2019
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: yes
+    toc_depth: '2'
+  html_notebook:
+    theme: journal
+    toc: yes
+    toc_depth: 2
+    toc_float: yes
+---
+
+
+```{r global_options, include=FALSE, cache = FALSE}
+library(knitr)
+opts_chunk$set(cache = TRUE, echo=TRUE, warning=FALSE, message=FALSE, linewidth=60)
+```
+
+\pagebreak 
+
+```{r packages,  warning= FALSE, message= FALSE, cache = FALSE}
+library(lme4)
+
+library(knitr)
+library(survival)
+library(coxme)
+
+
+library(zoo)
+
+library(ggthemes)
+library(grid)
+library(gridExtra)
+library(ggbeeswarm)
+
+library(stringr)
+
+library(tidyverse)
+
+library(parallel)
+```
+
+```{r functions}
+#Convenience functions 
+numextract <- function(string){
+  as.numeric(str_extract(string, "\\-*\\d+\\.*\\d*"))
+}
+
+comma <- function(x) format(x, digits = 3, big.mark = ",")
+
+comma_1 <- function(x) format(x, digits = 1, big.mark = ",")
+
+comma_2 <- function(x) format(x, digits = 2, big.mark = ",")
+
+comma_p <- function(x){
+  if (x < 0.001){
+    return("< 0.001")
+  }
+  if (x<0.01 & x>=0.001){
+    paste("=", format(x, digits = 3, big.mark = ","))
+  }
+  else{
+    paste("=", format(x, digits = 2, big.mark = ","))
+  }
+} 
+
+```
+
+# Mixed-effects Cox Model Fitting
+
+```{r data_in}
+to_model <- read.csv("clean_time_series_revise2006_2015.csv")
+
+#for table S4
+tx_hr <- haven::read_sas("SAF 2018 Q3/tx_hr.sas7bdat", NULL) %>%  
+  haven::zap_formats() %>% haven::zap_labels()
+
+to_model
+```
+
+
+```{r formulas_nested_models}
+#three-status, donor quality, and transplant year
+three_status <- "Surv(t_1, t_2, dead) ~ tx*(stat_2 + stat_1b) 
++ tx_risky_don + era_tx"
+
+#six-status, donor quality and transplant year
+six_status <- "Surv(t_1, t_2, dead) ~ tx*(status_2 + status_3 + status_4 + status_6) + 
+tx_risky_don + era_tx"
+```
+
+
+
+```{r run_fe_cox_models}
+formulas <- c(three_status,six_status)
+
+fe_models <- vector(mode = "list", length(formulas))
+hz_list <- vector(mode = "list", length(formulas))
+
+for (i in seq_along(formulas)) {
+  coxph_fe <- coxph(as.formula(formulas[[i]]), to_model)
+  print(formulas[[i]])
+  print(coxph_fe)
+  fe_models[[i]] <- coxph_fe
+
+  #estimate baseline hazard function when all covariates equal to zero 
+  # Status 1A, after "Status 1A", low risk donor
+  basehz <- basehaz(coxph_fe, centered=FALSE) %>% 
+    mutate(hz_t = if_else(time ==1, hazard, (hazard - lag(hazard))/(time -lag(time))), 
+           hz_t_time = if_else(time ==1, hz_t*time, hz_t*(time -lag(time))), 
+           cum_hz = cumsum(hz_t_time)) %>% select(time, hz_t)
+
+  hz_list[[i]] <- basehz
+}
+```
+
+
+```{r fit_me_model}
+
+me_models <-  vector(mode = "list", length(formulas))
+
+for (i in seq_along(formulas)) {
+  f_coxme <- as.formula(paste(formulas[[i]], " + (1+ tx|center)"))
+  start_time <- Sys.time()
+  three_status <- coxme(f_coxme, data = to_model)
+  me_models[[i]] <- three_status 
+  end_time <- Sys.time()
+  diff_time <- end_time - start_time
+  print(f_coxme)
+  print(diff_time)
+}
+
+
+#save.image("model_fit.RData")
+```
+
+
+## Variance in transplant benefit 
+
+Here we write a function to calculate the between center combination in the survival benefit of transplant on the log hazard scale
+
+$survivalBenefit_i = \nu_{1i} - \nu_{0i}$
+
+$Var(\nu_{i1} - \nu_{i0}) = Var(v_{1i}) + Var(\nu_{0i}) - 2*Cov(v_{1i}, v_{0i})$
+
+and finally since `coxme` returns the correlation between the random effects
+
+$Cov(v_{1i}, v_{0i}) = Corr(v_{1i}, v_{0i})*\sigma_{v_{0i}}\sigma_{v_{1i}}$
+
+
+```{r var_tx_benefit}
+variance_survival_benefit <- function(me_cox){
+  variance_est <- me_cox$vcoef[[1]]
+  
+  var_wait <- variance_est[[1,1]]
+  var_tx <- variance_est[[2,2]]
+  cov_tx_wait <- variance_est[[1,2]]*sqrt(variance_est[[1,1]])*sqrt(variance_est[[2,2]])
+  
+  return(var_wait + var_tx - 2*cov_tx_wait)
+}
+```
+
+## 3 status `coxme` results
+```{r three_status_me_results}
+three_status <- me_models[[1]]
+
+basehz <- hz_list[[1]]
+
+three_status_var <- variance_survival_benefit(three_status)
+
+three_status
+```
+The calculated variance in the survival benefit of transplant $B = Tx - Wait$ is `r comma(three_status_var)` on log hazard ratio scale for the 3-status model
+
+
+## 6 status `coxme` results
+```{r six_status_results}
+six_status <- me_models[[2]]
+
+basehz_six_stat <- hz_list[[2]]
+
+six_status_var <- variance_survival_benefit(six_status)
+
+
+six_status
+```
+
+The calculated variance in the survival benefit of transplant $B = Tx - Wait$ in the six-status model decreased by a factor of `r comma_2((three_status_var-six_status_var)/three_status_var)` from `r comma(three_status_var)` to `r comma(six_status_var)` on log hazard ratio scale compared to the three-status system.
+
+
+\pagebreak
+
+# Survival Benefit Calculations
+```{r hr_tx_ij}
+hr_tx_ij <- function(model = three_status, df= to_model, i, j){
+  #this function returns the log hazard ratio of transplant 
+  #for patient j transplanted at center i for a given coxme model  
+  fixed_effects <- fixef(model)
+  x_vars <- names(fixed_effects)
+  ref <- data.frame(ranef(model)[[1]])
+  ref$center <- row.names(ref)
+  tx_ref <- filter(ref, center == i)$tx
+  
+  is_int <- function(x) grepl("tx:", x)
+  ints <- x_vars[sapply(x_vars, is_int)]
+  non_ints <- setdiff(x_vars, ints)
+
+  d_ij <- df %>% filter(PX_ID == j) %>% group_by(tx) %>% 
+    filter(row_number()==1 & tx ==1) %>% select(one_of(non_ints))
+
+  h_ij <- tx_ref + unname(fixed_effects['tx'])
+  for (x in ints) {
+  	  fe_tx <- unname(fixed_effects[x])
+  	  c_list <- strsplit(x, ":")
+  	  int_var <- c_list[[1]][2]
+  	  h_ij <- h_ij + d_ij[[int_var]]*fe_tx
+  }
+  return(h_ij)
+}
+
+```
+
+\pagebreak
+
+
+## Function to plot survival functions under transplant or no transplant
+  
+Warnings:
+
+* factor variables are NOT supported, every covariate MUST be a continuous or zero/one.  
+* Do not use any candidate covariates with tx in the name this will cause this function to silently fail.
+* Donor covariates should be coded with a tx_ prefix
+
+```{r benefit_estimate_ij}
+b_ij <- function(df, base_hz, model, i, j){
+
+
+fixed_effects <- fixef(model)
+x_vars <- names(fixed_effects)
+ref <- data.frame(ranef(model)[[1]])
+ref$center <- row.names(ref)
+
+d_ij <- df %>% filter(PX_ID == j) %>% 
+  select(PX_ID, t_1, t_2, dead, one_of(x_vars)) %>% 
+  mutate(time = t_1, 
+         time  = ifelse(time==0, 1, time), 
+         fe_lp = 0, lp_no_tx = 0)
+
+for (x in x_vars) {
+	fe_x <- unname(fixed_effects[x])
+
+	if(grepl("tx:", x) == FALSE){
+		d_ij$c_x <- d_ij[[x]]
+	}
+	##add code to deal with interaction terms here
+	if(grepl("tx:", x) == TRUE){
+	  c_list <- strsplit(x, ":")
+	  int_var <- c_list[[1]][2]
+	  d_ij$c_x <- d_ij[[int_var]]*d_ij[["tx"]]
+	}
+
+	d_ij <- d_ij %>% mutate(fe_lp = fe_lp + c_x*fe_x) %>% select(-c_x)
+}
+
+###Hypothetical when patient has always been transplanted
+non_tx_terms <- lapply(x_vars, function(x) if(grepl("tx", x) == FALSE) x)
+non_tx_terms <- non_tx_terms[-which(sapply(non_tx_terms, is.null))]
+
+for (x in non_tx_terms) {
+	fe_x <- unname(fixed_effects[x])
+	d_ij$c_x <- d_ij[[x]]
+	d_ij <- d_ij %>% mutate(lp_no_tx = lp_no_tx + c_x*fe_x) %>% select(-c_x)
+}
+
+
+d_ij <- left_join(base_hz, d_ij, by = c("time")) %>% 
+  select(-t_1, -t_2)
+
+d_ij <- d_ij %>% 
+  mutate_all(funs(na.locf(., na.rm = FALSE)))
+
+ctr_i_b0 <- ref[ref$center == i,]$Intercept
+ctr_i_b1 <- ref[ref$center == i,]$tx
+
+d_ij <- d_ij %>% mutate(
+	fe_wait = lp_no_tx,
+	fe_tx = fe_lp,
+	ctr_hz_wait = hz_t*exp(fe_wait + ctr_i_b0),
+	ctr_hz_tx = hz_t*exp(fe_tx + ctr_i_b0 + ctr_i_b1)
+	) %>%
+	mutate(wait_surv = cumprod(1-ctr_hz_wait)) %>% 
+	group_by(tx) %>% 
+	mutate(
+		surv_post_tx = if_else( tx ==1, cumprod(1-ctr_hz_tx), NULL), 
+		surv_post_tx = max(wait_surv)*surv_post_tx) %>% ungroup()
+
+tx_point <- d_ij %>% 
+  group_by(tx) %>% 
+  filter(row_number()==1 & tx==1) %>% 
+  ungroup()
+
+
+if (nrow(tx_point)==0) warning(paste0("Candidate ", j, " not transplanted"))
+
+if (nrow(tx_point)>0) {
+plot_i_j <- ggplot() + 
+  geom_step(data = d_ij, 
+            aes(y =wait_surv, 
+                x = time, 
+                color = "Waitlist Survival"), 
+            size = 1.5) +
+  geom_step(data = d_ij, 
+            aes(y =surv_post_tx, 
+                x = time, 
+                color = "Post-transplant survival"), 
+            size = 1.5) + 
+  geom_ribbon(data = d_ij, 
+              aes(x= time, 
+                  ymin = wait_surv, 
+                  ymax = surv_post_tx, 
+                  fill = "Survival Benefit"), 
+              alpha = 0.5) + 
+  geom_point(data = tx_point, 
+             aes(x = time, 
+                 y = surv_post_tx, 
+                 shape= "Transplant"), 
+             size = 5, colour = "darkgreen") + 
+  labs(x = "Time(days)", y = "Survival", shape = "", fill = "") + 
+  scale_y_continuous(limits = c(0,1), breaks = seq(0,1, 0.25)) + 
+  scale_x_continuous(breaks = seq(0, 3650, 365)) + 
+  scale_color_manual(name = NULL, values=c("blue", "red")) + 
+  scale_fill_manual(name = "", values = c("lightblue"))
+	
+return(plot_i_j)	
+}
+
+
+}
+
+```
+
+
+\pagebreak
+
+## Function to calculate 5-year survival benefit
+
+
+this function calculates the survival benefit for a given set of times (default is five-years). Calculates the survival function conditional upon reaching transplant ("resets" the survival curve to 100% at transplant)
+
+Warnings:
+
+* factor variables are NOT supported, every covariate MUST be a continuous or zero/one.  
+* Do not use any candidate covariates with tx in the name this will cause this function to silently fail.
+* Donor covariates should be coded with a tx_ prefix
+
+
+```{r wait_tx_5_year}
+ben_wait_tx <- function(df = to_model, 
+                        base_hz = basehz, 
+                        model = three_status, i, j, end_times = 1825){
+
+
+
+
+max_end_time <- max(end_times)
+
+fixed_effects <- fixef(model)
+x_vars <- names(fixed_effects)
+ref <- data.frame(ranef(model)[[1]])
+ref$center <- row.names(ref)
+
+d_ij <- df %>% 
+  filter(PX_ID == j) %>% 
+  select(PX_ID, t_1, t_2, dead, one_of(x_vars)) %>% 
+  mutate(time = t_1, 
+         time  = ifelse(time==0, 1, time), 
+         fe_lp = 0, 
+         lp_no_tx = 0)
+
+for (x in x_vars) {
+	fe_x <- unname(fixed_effects[x])
+
+	if(grepl("tx:", x) == FALSE){
+		d_ij$c_x <- d_ij[[x]]
+	}
+	##add code to deal with interaction terms here
+	if(grepl("tx:", x) == TRUE){
+	  c_list <- strsplit(x, ":")
+	  int_var <- c_list[[1]][2]
+	  d_ij$c_x <- d_ij[[int_var]]*d_ij[["tx"]]
+	}
+
+	d_ij <- d_ij %>% mutate(fe_lp = fe_lp + c_x*fe_x) %>% select(-c_x)
+}
+
+###Hypothetical when patient has always been transplanted
+non_tx_terms <- lapply(x_vars, function(x) if(grepl("tx", x) == FALSE) x)
+non_tx_terms <- non_tx_terms[-which(sapply(non_tx_terms, is.null))]
+
+for (x in non_tx_terms) {
+	fe_x <- unname(fixed_effects[x])
+	d_ij$c_x <- d_ij[[x]]
+	d_ij <- d_ij %>% mutate(lp_no_tx = lp_no_tx + c_x*fe_x) %>% select(-c_x)
+}
+
+
+d_ij <- left_join(base_hz, d_ij, by = c("time")) %>% select(-t_1, -t_2)
+
+d_ij <- d_ij %>% 
+  mutate_all(funs(na.locf(., na.rm = FALSE))) %>% 
+  filter(tx ==1) %>% 
+  mutate(time = time - min(time)+1)
+
+ctr_i_b0 <- ref[ref$center == i,]$Intercept
+ctr_i_b1 <- ref[ref$center == i,]$tx
+
+d_ij <- d_ij %>% mutate(
+	fe_wait = lp_no_tx,
+	fe_tx = fe_lp,
+	ctr_hz_wait = hz_t*exp(fe_wait + ctr_i_b0),
+	ctr_hz_tx = hz_t*exp(fe_tx + ctr_i_b0 + ctr_i_b1)
+	) %>%
+	mutate(wait_surv = cumprod(1-ctr_hz_wait)) %>% 
+	group_by(tx) %>% 
+	mutate(
+		surv_post_tx = if_else( tx ==1, cumprod(1-ctr_hz_tx), NULL), 
+		surv_post_tx = max(wait_surv)*surv_post_tx) %>% ungroup()
+
+
+d_ij <- d_ij %>% 
+  filter(time <= max_end_time) %>% 
+  mutate(surv_benefit = surv_post_tx - wait_surv)
+
+if (nrow(d_ij)==0) warning(paste0("Candidate ", j, " not transplanted"))
+
+
+  s_benefit <- vector(mode = "numeric", length = 2)
+  
+  wait_5 <- filter(d_ij, time == end_times)$wait_surv
+  post_5 <- filter(d_ij, time == end_times)$surv_post_tx
+  
+  if (length(wait_5) == 0){
+     wait_5 <- NA
+  }
+  
+  if (length(post_5)==0){
+     post_5 <- NA
+  }
+  
+  s_benefit[[1]] <- wait_5
+  
+  s_benefit[[2]] <- post_5
+  
+	return(s_benefit)
+
+}
+```
+
+\pagebreak
+
+## Distribution of survival benefit at five years for each center (three-status system)
+
+Warnings:
+
+* this loop takes advantage of parallel processing and will use most of your cores. 
+* Despite this expect long computational times.
+```{r benefit_wait_post_5}
+
+detectCores()
+
+no_cores <- detectCores() - 2
+# Initiate cluster
+cl <- makeCluster(no_cores,  type="FORK")
+
+center_loop <- function(centers, recips, cl){
+
+  #output tibbles
+  wait_surv <- tibble(recips = recips)
+  post_tx_surv <- tibble(recips = recips)
+  
+  for (c in centers) {
+  	cur_center <- as.numeric(c)
+  	print(paste0("currently calculating for center ", c))
+  	
+  	B_i <- parSapply(cl, r_list, 
+  	                 function(x) ben_wait_tx(j = x, 
+  	                                         df = to_model, 
+  	                                         base_hz = basehz, 
+  	                                         model = three_status, 
+  	                                         i = cur_center))
+  	
+  	B_trans <- matrix(B_i, nrow = 2, ncol = length(recips)) %>% t()
+  	B_tib <-  as.tibble(B_trans) 
+
+
+  	wait <- B_tib %>% select(V1) %>% cbind(recips)
+  	colnames(wait) <- c(c, "recips")
+  	
+  	post_tx <- B_tib %>% select(V2) %>% cbind(recips)
+  	colnames(post_tx) <- c(c, "recips")
+  	
+  	wait_surv <- wait_surv %>% left_join(wait, by = "recips")
+  	
+  	post_tx_surv <- post_tx_surv %>% left_join(post_tx, by = "recips")
+  	
+
+  }
+  benefit <- list(wait_surv, post_tx_surv)
+  
+  return(benefit)
+}
+
+
+r_list <- unique(filter(to_model, tx ==1)$PX_ID)
+c_list <- as.numeric(row.names(ranef(three_status)[[1]]))
+
+
+by_time_tibbles <- center_loop(c_list, r_list, cl)
+
+
+stopCluster(cl)
+
+five_yr_wait <- by_time_tibbles[[1]]
+
+five_yr_post <- by_time_tibbles[[2]]
+```
+
+## Make datasets for use in Figures and Results Section
+```{r make_center_level_dataset}
+
+#recipients
+recips <- to_model %>% group_by(PX_ID) %>% filter(tx == 1) %>% ungroup()
+
+#marginal distribution of benefit of transplant
+marginal_hazards <- mapply(hr_tx_ij, i = recips$center, j = recips$PX_ID)
+
+marginal_waits_posts <- mapply(ben_wait_tx, i = recips$center, j = recips$PX_ID)
+
+marginal_waits <- marginal_waits_posts[1,]
+marginal_posts <- marginal_waits_posts[2,]
+
+pop_tx_hz <- recips %>% cbind(marginal_hazards, marginal_waits, marginal_posts) %>% 
+  mutate(log_hazard = marginal_hazards, 
+         hr = exp(log_hazard),
+         benefit= marginal_posts- marginal_waits)
+
+r_list <- unique(filter(to_model, tx ==1)$PX_ID)
+c_list <- as.numeric(row.names(ranef(three_status)[[1]]))
+
+center_OPO <- recips %>% select(center, OPO) %>% 
+  group_by(center, OPO) %>% 
+  summarise(num_tx = n()) %>% ungroup()
+
+re_effects <- data.frame(ranef(three_status)[[1]])
+
+re_effects$center <- row.names(re_effects)
+
+colnames(re_effects)[2] <- "tx_re"
+
+#make a center level dataset of random effects
+center_re <- center_OPO %>% 
+  left_join(re_effects %>% mutate(center = as.numeric(center))) %>% 
+  mutate(tx_exp = exp(tx_re),
+         benefit = tx_re-Intercept,
+         intercept_exp = exp(Intercept)) %>% ungroup()
+
+center_re <- center_re %>% left_join(five_year_means)
+
+#calculate the minimum and maximum center
+min_tx_exp <- min(center_re$tx_exp)
+
+max_tx_exp <- max(center_re$tx_exp)
+
+min_int_exp <- min(center_re$intercept_exp)
+
+max_int_exp <- max(center_re$intercept_exp)
+```
+
+
+
+```{r summarize_five_year_benefit}
+
+#make benefit dataframe- hypothetical estimates as if all recipients were transplanted at the center
+colnames(five_yr_wait) <- c("recips", c_list)
+colnames(five_yr_post) <- c("recips", c_list)
+
+M <- merge(five_yr_post,five_yr_wait,by="recips")
+
+ben_five_year_only <- M[,grepl("*\\.x$",names(M))] - M[,grepl("*\\.y$",names(M))]
+
+cbind(M[,1,drop=FALSE],ben_five_year_only)
+remove(M)
+
+five_year_waits <- five_yr_wait %>% select(-recips) %>% 
+  summarise_all(mean, na.rm =TRUE) %>% 
+  gather(value = mean_five_year_wait, key = center) %>% 
+  select(center, mean_five_year_wait) %>% mutate(center = as.numeric(center))
+
+five_year_posts <- five_yr_post %>% select(-recips) %>% 
+  summarise_all(mean, na.rm =TRUE) %>% 
+  gather(value = mean_five_year_post, key = center) %>% 
+  select(center, mean_five_year_post) %>% mutate(center = as.numeric(center))
+
+
+#center level dataset of summary statistics for case-mix adjusted 
+#five-year mean waitlist, post-transplant, and survival benefits
+five_year_means <- ben_five_year_only %>% 
+  summarise_all(funs(mean, 
+                     median, 
+                     sd, 
+                     IQR, 
+                     lowQR = quantile(., probs=0.25), 
+                     upQR = quantile(., probs=0.75)), na.rm = TRUE) %>%
+  gather(key = "key", value = "value") %>%
+  separate(key, c("center", "stat"), sep = "_") %>%
+  spread(stat, value) %>% 
+  mutate(center = numextract(center), mean_five_year = mean) %>% select(-mean) %>%
+  left_join(five_year_waits, by = "center") %>% 
+  left_join(five_year_posts, by = "center") %>%  
+  left_join(center_OPO, by = "center")
+
+five_year_means <- five_year_means %>%
+  mutate(se_mean = sd/sqrt(num_tx),
+         upper_ci = mean_five_year + 1.96*se_mean,
+         lower_ci = mean_five_year - 1.96*se_mean,
+         sig_better = if_else(lower_ci >mean(five_year_means$mean_five_year), 1, 0),
+         sig_worse = if_else(upper_ci <mean(five_year_means$mean_five_year), 1, 0),
+         center_performance = case_when(
+           lower_ci >mean(five_year_means$mean_five_year) ~ "High",
+           upper_ci <mean(five_year_means$mean_five_year) ~ "Low",
+           TRUE ~ "Average"
+         ), center_performance = factor(center_performance, 
+                                        levels = c("Low", "Average", "High")))
+
+```
+
+```{r six_status_pop, warning= FALSE, message = FALSE}
+#marginal distribution of benefit of transplant under six status model
+marginal_hazards_6_stat <- mapply(hr_tx_ij, 
+                                  i = recips$center, 
+                                  j = recips$PX_ID, 
+                                  MoreArgs = list(model = six_status))
+
+marginal_waits_posts_6_stat <- mapply(ben_wait_tx, 
+                                      i = recips$center, 
+                                      j = recips$PX_ID,  
+                                      MoreArgs = list(base_hz = basehz_six_stat,
+                                                      model = six_status))
+
+marginal_waits_6_stat <- marginal_waits_posts_6_stat[1,]
+marginal_posts_6_stat <- marginal_waits_posts_6_stat[2,]
+
+
+pop_tx_hz_6_stat <- recips %>% cbind(marginal_waits_6_stat, marginal_posts_6_stat) %>% 
+  mutate(benefit_6 = marginal_posts_6_stat - marginal_waits_6_stat)
+
+#not run- save workspace image
+#save.image("model_fit_06_15_w_benefits.RData")
+```
+
+\pagebreak
+
+# Figures
+
+
+
+## Figure 2: Between-center Variation in the Survival Benefit Associated with Heart Transplantation
+```{r catepillar_plot, warning=FALSE, message= FALSE}
+to_plot <- five_year_means %>% arrange(mean_five_year) %>% mutate(index = row_number())
+
+
+g_legend<-function(a.gplot){
+  tmp <- ggplot_gtable(ggplot_build(a.gplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)}
+
+catepillar <- ggplot(to_plot, aes(x = index, 
+                    y = mean_five_year*100, 
+                    ymin = lower_ci*100, 
+                    ymax = upper_ci*100, 
+                    color = center_performance)) + 
+  geom_point() + 
+  geom_errorbar() + 
+  scale_color_manual(name = "Center benefit:",
+                     values= c("red3","black","navyblue"), 
+                     guide = guide_legend()) +
+  
+  scale_x_continuous(breaks = c(1, 113)) +
+  scale_y_continuous(breaks = seq(25, 60, 5), limits = c(25, 60)) +
+  labs(y = "Absolute five-year survival benefit \nof heart transplant (%)",
+       x = "Center", color = "") +  
+  theme_few() + 
+  theme(axis.title = element_text(), 
+        axis.title.y = element_text(), 
+        legend.title=element_text(size=12),
+        legend.text=element_text(size=12),
+        panel.grid.major.y = element_line(color = "gray", size = 0.25),
+        legend.position="bottom") 
+
+
+box <- ggplot(to_plot %>% mutate(all = " "), aes(x = all, y = 100*mean_five_year)) + 
+  geom_boxplot() +
+  stat_boxplot(geom = "errorbar", width = 0.5) +
+  geom_point(y = mean(to_plot$mean_five_year)*100, 
+             aes(x =all, shape = "mean"), 
+             size=4, fill = "gray", alpha = 0.5 )+ 
+  theme_few() +
+  labs(x = " ", shape = " ") +
+  scale_shape_manual(values = 23) + 
+  theme(
+        axis.title.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y =  element_blank(),
+        legend.title=element_text(size=12),
+        legend.text=element_text(size=12),
+        panel.grid.major.y = element_line(color = "gray", size = 0.25),
+        legend.position= "bottom",
+        legend.justification='left') +
+  scale_y_continuous(limits = c(25, 60), breaks = seq(25, 60, 5))
+
+fig_2 <- grid.arrange(catepillar, box,
+                         nrow=1, widths = c(1, 0.25))
+
+num_high <- table(five_year_means$center_performance)["High"][[1]]
+
+num_low <- table(five_year_means$center_performance)["Low"][[1]]
+
+max_benefit <- comma_2(100*max(to_plot$mean_five_year))
+
+
+min_benefit <- comma_2(100*min(to_plot$mean_five_year))
+
+
+high_qrt_5 <- comma_2(100*quantile(to_plot$mean_five_year, probs = 0.75))
+
+low_qrt_5 <- comma_2(100*quantile(to_plot$mean_five_year, probs = 0.25))
+
+median_5 <- comma_2(100*median(to_plot$mean_five_year))
+
+ggsave( "fig_2.pdf", plot = fig_2, width = 6, height = 4)
+```
+Between-center variation in the absolute improvement in mean five-year survival associated with heart transplantation. Caterpillar plot (left) of center estimates case-mix adjusted for time from listing to transplant, waitlist Status, year of listing, donor quality, and cold ischemic time. Ninety-five percent confidence intervals are constructed using the variance of the distribution of five-year survival estimates for the entire study population and the number of transplants performed at each center during the study period. Compared to the mean center, `r num_high` centers (`r comma_2(100*num_high/nrow(center_re))`%) had significantly higher survival benefit and `r num_low` centers (`r comma_2(100*num_low/nrow(center_re))`%) had lower benefit.
+
+The adjusted five-year survival benefit varied substantially by center, ranging from `r min_benefit`% to `r max_benefit`%, median `r median_5` and IQR [`r low_qrt_5`% - `r high_qrt_5`%] (Box plot, right). Whiskers represent smallest and largest observations within 1.5 times the IQR of the hinges, points represent outliers beyond this range. The mean of center five-year survival benefits is represented by a gray diamond. 
+
+
+\pagebreak
+
+## Figure 3: Relationship between Candidate Survival on the Waitlist, Recipient Post-Transplant Outcomes, and the Benefit of Heart Transplantation
+```{r combined_figure_4_discrete, warning=FALSE, message= FALSE}
+
+panel_A <- ggplot(data = center_re, 
+                  aes(x = 100*mean_five_year_wait, 
+                      y = 100*mean_five_year)) + 
+  geom_point(aes(color = center_performance), size = 2.5, alpha = 0.9) +
+  #annotate("label", x = 25, y = 30, label = paste0("r = ", cor_model), size = 5) + 
+  scale_x_continuous(name = "Five-year survival without transplant (%)", 
+                     limits = c(18, 44), 
+                     breaks =  c(20, 25, 30, 35, 40)) + 
+  scale_y_continuous(name = "Center five-year surival benefit (%)", 
+                     limits = c(27, 60), breaks = seq(30, 60, 5)) + 
+  scale_color_manual(name = "Center benefit:", 
+                     values = c("red3","black","navyblue")) +
+  theme_few() + 
+  ggtitle("Panel A") + 
+  theme(legend.key = element_rect(fill = "white"), 
+        legend.background = element_rect(fill = "white"),
+        legend.direction = "horizontal",
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black", size = 0.25),
+        plot.title = element_text(hjust = 0.5),
+        legend.title=element_text(size=12),
+        legend.text=element_text(size=12),
+        legend.box.background = element_rect(colour = "black"))
+
+
+
+mylegend <- g_legend(panel_A)
+
+
+
+panel_B <- ggplot(data = center_re, 
+                  aes(x = mean_five_year_post*100, y = 100*mean_five_year)) + 
+  geom_point(aes(color = center_performance), size = 2.5, alpha = 0.9) +
+  scale_x_continuous(name = "Five-year post-transplant survival (%)", 
+                     limits = c(63, 89), 
+                     breaks =  c(65, 70, 75, 80, 85)) +
+  scale_y_continuous(limits = c(27, 60), breaks = seq(30, 60, 5)) +
+scale_color_manual(values = c("red3","black","navyblue")) +
+  theme_few() +
+  ggtitle("Panel B")+
+  theme(axis.title.y = element_blank(), 
+        panel.border =  element_blank(),
+        axis.line = element_line(color = "black", size = 0.25),
+        legend.position="none",
+        panel.grid.major.y = element_line(color = "gray", size = 0.25),
+        plot.title = element_text(hjust = 0.5))
+
+
+
+fig_3 <- grid.arrange(
+  arrangeGrob(panel_A + theme(legend.position="none", 
+                      panel.grid.major.y = element_line(color = "gray", size = 0.25)),
+                         panel_B,
+                         nrow=1, widths = c(1, 0.95)),
+                      mylegend, 
+             nrow=2,heights=c(10, 2.2))
+
+
+slope_waitlist <- lm(mean_five_year ~ mean_five_year_wait, 
+                                         data = center_re)
+
+slope_post <- lm(mean_five_year ~ mean_five_year_post, 
+                                         data = center_re)
+
+pct_benefit_increase_per_neg_10 <- comma_2(
+  10*-slope_waitlist$coefficients[[2]])
+
+ci_slope_wait_low <- comma_2(10*-confint(slope_waitlist, 'mean_five_year_wait', level=0.95)[1,1])
+
+ci_slope_wait_up <- comma_2(10*-confint(slope_waitlist, 'mean_five_year_wait', level=0.95)[1,2])
+
+
+pct_benefit_increase_post <- comma_2(10*slope_post$coefficients[[2]])
+
+
+ci_slope_post_low <- comma_2(10*-confint(slope_post, 'mean_five_year_post', level=0.95)[1,1])
+
+ci_slope_post_up <- comma_2(10*-confint(slope_post, 'mean_five_year_post', level=0.95)[1,2])
+
+ggsave("fig_3.pdf", plot = fig_3)
+```
+Mean five-year survival without transplant, five-year post-transplant survival, and five-year survival benefit for each US heart transplant center. There was a significant relationship between the Status-adjusted medical urgency of candidates listed by each center (as measured by risk of death on the waitlist) and the benefit of transplantation measured by five-year survival benefit (left panel).  For every 10% decrease in expected candidate waitlist surival, there was a `r pct_benefit_increase_per_neg_10`% increase in estimated survival benefit associated with heart transplant  (95% CI `r ci_slope_wait_up`% - `r ci_slope_wait_low`%). In contrast, there was no significant relationship between post-transplant survival and benefit (+`r pct_benefit_increase_post`%, 95% CI `r ci_slope_post_up`%- `r ci_slope_post_low`%) (right panel).
+
+
+\pagebreak
+
+## Figure 4A: Five-year Survival Benefit Associated with Heart Transplantation by Three-status at Transplantation 
+```{r box_plot_of_benefits, warning=FALSE, message= FALSE}
+five_yr_by_status <- pop_tx_hz %>% 
+  group_by(three_status) %>%
+  summarise(
+    number = n(), 
+    median = 100*median(benefit, na.rm = TRUE),
+    upper_IQR = 100*quantile(benefit, probs = 0.75, na.rm = TRUE),
+    lower_IQR = 100*quantile(benefit, probs = 0.25, na.rm = TRUE),
+    mean = 100*mean(benefit, na.rm = TRUE),
+    mean_waitlist = 100*mean(marginal_waits, na.rm = TRUE),
+    mean_post = 100*mean(marginal_posts, na.rm = TRUE)
+  )
+
+five_yr_by_status
+
+
+
+three_box <- ggplot(data = pop_tx_hz %>%
+              mutate(x_labels = case_when(
+                three_status == "Status 1A" ~ paste0("Status 1A\nN =",
+                                                comma_2(filter(five_yr_by_status,
+                                                               three_status == "Status 1A")$number)),
+                three_status == "Status 1B" ~ paste0("Status 1B\nN =", 
+                                                comma_2(filter(five_yr_by_status, 
+                                                               three_status == "Status 1B")$number)),
+                three_status == "Status 2" ~ paste0("Status 2\nN =", 
+                                              comma_2(filter(five_yr_by_status, 
+                                                             three_status == "Status 2")$number))
+                      )), 
+  aes(y = 100*benefit, x=x_labels, color = three_status, fill = three_status)) + 
+  geom_dotplot(binaxis = "y", 
+               stackdir='center', 
+               binwidth =  1, dotsize =  0.2, stackratio = .5) + 
+  guides(color=FALSE, fill = FALSE) +
+  labs(y = "Absolute 5-year survival benefit (%)", fill = "") +
+  scale_y_continuous(limits = c(-5, 100)) + 
+  theme_few() + 
+  theme(axis.title.x = element_blank(),
+        panel.grid.major.y = element_line(color = "gray", size = 0.25)) +
+  scale_x_discrete(expand = expand_scale( mult = c(0.5, 0.2))) +
+  scale_color_brewer(palette = "Set1", direction = -1) +
+  scale_fill_brewer(palette = "Set1", direction = -1) +
+  stat_boxplot(aes(x = x_labels, y = 100*benefit), 
+               geom = "errorbar", 
+               color = "black", 
+               width = 0.25, lwd=0.75) +
+  geom_boxplot(aes(x = x_labels, y = 100*benefit), 
+               alpha = 0, color = "black", 
+               outlier.shape = NA, 
+               width = 0.5, lwd=0.75, fatten = 1.5)
+
+three_box
+
+ggsave("fig_4A.eps", plot = three_box, width = 8, height = 5)
+```
+Dot and box plots of estimated five-year survival benefit associated with heart transplantation for adult recipients by Status at transplantation between 2006-2015. There were 11,227 Status 1A recipients with median benefit from transplant of 59%, [IQR 54- 62%]. There were 7,250 Status 1B recipients with median benefit from transplant of 27%, [IQR 23- 31%]. In addition, there were only 1,338 Status 2 recipients with median benefit from transplant of 14%, [IQR 10- 17%]. Within priority Status groups, the standard deviation in the five-year survival benefit associated with transplant was 5.5% with the majority (76%) of the variation amongst recipients attributable to center-level effects and the remaining 24% attributable to variation in transplant year, waiting time, donor quality and ischemic time.
+
+\pagebreak
+
+
+## Figure 4B: Five-year Survival Benefit Associated with Heart Transplantation by Six-status at Transplantation
+```{r 5b_revised, warning=FALSE, message= FALSE}
+
+
+line_thickness <- 0.55
+fatten_level <- 1.5
+
+five_yr_by_six_status <- pop_tx_hz_6_stat %>%
+  group_by(six_status) %>%
+  summarise(
+    number = n(), 
+    median = 100*median(benefit_6, na.rm = TRUE),
+    upper_IQR = 100*quantile(benefit_6, probs = 0.75, na.rm = TRUE),
+    lower_IQR = 100*quantile(benefit_6, probs = 0.25, na.rm = TRUE),
+    mean = 100*mean(benefit_6, na.rm = TRUE),
+    mean_waitlist = 100*mean(marginal_waits_6_stat, na.rm = TRUE),
+    mean_post = 100*mean(marginal_posts_6_stat, na.rm = TRUE)
+  )
+
+
+
+g1 <- ggplot(pop_tx_hz_6_stat %>%
+                    filter(six_status == 1) %>%
+                    mutate(six_status = paste0("Status 1\nN =", 
+                                               comma_2(filter(five_yr_by_six_status, 
+                                                              six_status == 1)$number)))) + 
+  geom_dotplot(aes(x = six_status, y = 100*benefit_6),
+               color = RColorBrewer::brewer.pal(3, "Set1")[[3]],
+               fill = RColorBrewer::brewer.pal(3, "Set1")[[3]],
+               binaxis = "y", stackdir = "center", 
+               method="dotdensity", stackgroups = T, binpositions="all", 
+               binwidth =  1, dotsize =  0.2, stackratio = .5) +
+    theme_few() +theme(axis.title.x = element_blank(), 
+                       panel.border=element_blank(), 
+                       axis.line = element_line(color="black", size = 0.25),
+                       legend.position = "none",
+                       plot.margin = margin(0,-4,0,2),
+                       panel.grid.major.y = element_line(color = "gray", size = 0.25)) +
+  scale_y_continuous(name = "Absolute 5-year survival benefit (%)", limits = c(-5, 100)) +
+  stat_boxplot(aes(x = six_status, y = 100*benefit_6),  
+               geom = "errorbar", color = "black", 
+               width = 0.25, lwd=line_thickness) + 
+  geom_boxplot(aes(x = six_status, y = 100*benefit_6), 
+               fill = "gray", alpha = 0, color = "black", 
+               outlier.shape = NA, width = 0.5, 
+               lwd=line_thickness, fatten = fatten_level) 
+
+
+for (i in c(2,3)){
+  assign(paste0("g", i), ggplot(pop_tx_hz_6_stat %>%
+                    filter(six_status == i) %>%
+                    mutate(six_status = case_when(
+                      six_status == 1 ~paste0("Status 1\nN =", 
+                                              comma_2(filter(five_yr_by_six_status, 
+                                                             six_status == 1)$number)),
+                      six_status == 2 ~paste0("Status 2\nN =", 
+                                              comma_2(filter(five_yr_by_six_status, 
+                                                             six_status == 2)$number)),
+                      six_status == 3 ~paste0("Status 3\nN =", 
+                                              comma_2(filter(five_yr_by_six_status, 
+                                                             six_status == 3)$number)),
+                      six_status == 4 ~paste0("Status 4\nN =", 
+                                              comma_2(filter(five_yr_by_six_status, 
+                                                             six_status == 4)$number)),
+                      six_status == 6 ~paste0("Status 6\nN =", 
+                                              comma_2(filter(five_yr_by_six_status, 
+                                                             six_status == 6)$number))
+                      ))) + 
+  geom_dotplot(aes(x = six_status, y = 100*benefit_6),
+               color = RColorBrewer::brewer.pal(3, "Set1")[[3]],
+               fill = RColorBrewer::brewer.pal(3, "Set1")[[3]],
+               binaxis = "y", stackdir = "center", 
+               method="dotdensity", stackgroups = T, binpositions="all", 
+               binwidth =  1, dotsize =  0.2, stackratio = .5) +
+    labs(fill = "", color = "") + 
+    theme_few() +theme(axis.title.x = element_blank(),
+                       panel.border=element_blank(),
+                       legend.position = "bottom",
+                       axis.line =  element_line(color="black", size = 0.25),
+                       axis.line.y = element_blank(),
+                       axis.ticks.y = element_blank(),
+                       axis.title.y = element_blank(),
+                       axis.text.y =element_blank(),
+                       plot.margin = margin(0,-4,0,-4),
+                       panel.grid.major.y = element_line(color = "gray", size = 0.25))+ 
+      scale_y_continuous(limits = c(-5, 100)) +
+      scale_color_brewer(palette = "Set1", direction = 1) +
+    scale_fill_brewer(palette = "Set1", direction = 1) +
+  stat_boxplot(aes(x = six_status, y = 100*benefit_6),  
+               geom = "errorbar", color = "black", 
+               width = 0.25, lwd=line_thickness) + 
+  geom_boxplot(aes(x = six_status, y = 100*benefit_6), 
+               fill = "gray", alpha = 0, color = "black", 
+               lwd=line_thickness, fatten = fatten_level) 
+  )
+}
+
+
+for (i in c(4, 6)){
+  assign(paste0("g", i), ggplot(pop_tx_hz_6_stat %>%
+                    filter(six_status == i) %>%
+                    mutate(six_status = case_when(
+                      six_status == 1 ~paste0("Status 1\nN =", 
+                                              comma_2(filter(five_yr_by_six_status, 
+                                                             six_status == 1)$number)),
+                      six_status == 2 ~paste0("Status 2\nN =", 
+                                              comma_2(filter(five_yr_by_six_status, 
+                                                             six_status == 2)$number)),
+                      six_status == 3 ~paste0("Status 3\nN =", 
+                                              comma_2(filter(five_yr_by_six_status, 
+                                                             six_status == 3)$number)),
+                      six_status == 4 ~paste0("Status 4\nN =",
+                                              comma_2(filter(five_yr_by_six_status, 
+                                                             six_status == 4)$number)),
+                      six_status == 6 ~paste0("Status 6\nN =", 
+                                              comma_2(filter(five_yr_by_six_status, 
+                                                             six_status == 6)$number))
+                      ))) + 
+  geom_dotplot(aes(x = six_status, y = 100*benefit_6, color = three_status, fill=three_status),
+               binaxis = "y", stackdir = "center", 
+               method="dotdensity", stackgroups = T, binpositions="all", 
+               binwidth =  1, dotsize =  0.2, stackratio = .5) +
+    labs(fill = "Status in 3 tier system:", color = "Status in 3 tier system:") + 
+    theme_few() +theme(axis.title.x = element_blank(),
+                       panel.border=element_blank(),
+                       legend.position = "bottom",
+                       axis.line =  element_line(color="black", size = 0.25),
+                       axis.line.y = element_blank(),
+                       axis.ticks.y = element_blank(),
+                       axis.title.y = element_blank(),
+                       axis.text.y =element_blank(),
+                       legend.title=element_text(size=11),
+                       legend.text=element_text(size=11),
+                       legend.background = element_blank(),
+                        legend.box.background = element_rect(colour = "black"),
+                       plot.margin = margin(0,-4,0,-4),
+                       panel.grid.major.y = element_line(color = "gray", size = 0.25))+ 
+      scale_y_continuous(limits = c(-5, 100)) +
+      scale_color_brewer(palette = "Set1", direction = -1) +
+    scale_fill_brewer(palette = "Set1", direction = -1) +
+  stat_boxplot(aes(x = six_status, y = 100*benefit_6),  
+               geom = "errorbar", color = "black", 
+               width = 0.25, lwd=line_thickness) + 
+  geom_boxplot(aes(x = six_status, y = 100*benefit_6), 
+               fill = "gray", alpha = 0, 
+               color = "black", outlier.shape = NA, 
+               width = 0.5, lwd=line_thickness, fatten = fatten_level)
+  )
+}
+
+mylegend <- g_legend(g4)
+
+
+
+Fig_4B <- grid.arrange(
+  arrangeGrob(g1 + theme(legend.position="none",
+                         panel.grid.major.y = element_line(color = "gray", size = 0.25)),
+              g2 + theme(legend.position="none", 
+                         panel.grid.major.y = element_line(color = "gray", size = 0.25)),
+              g3 + theme(legend.position="none", 
+                         panel.grid.major.y = element_line(color = "gray", size = 0.25)),
+              g4 + theme(legend.position="none", 
+                         panel.grid.major.y = element_line(color = "gray", size = 0.25)),
+              g6 + theme(legend.position="none", 
+                         panel.grid.major.y = element_line(color = "gray", size = 0.25)),
+                         nrow=1, widths = c(0.5, 0.3, 0.7, 1.2, 0.8)),
+                      mylegend, 
+             nrow=2,heights=c(10, 2.2)) 
+
+ggsave("fig_4B.eps", plot = Fig_4B, width = 10, height = 5)
+```
+
+
+
+Dot and box plot of estimated five-year survival benefit associated with heart transplantation for adult recipients by projected six-status at transplantation between 2006-2015. Dot color corresponds to three-status at transplant, x-axis corresponds to re-assigned six-tier Status. There would have been 255 Status 1 recipients with median benefit from transplant of 69%, [IQR 65- 71%], 1,254 Status 2 recipients with median benefit from transplant of 65%, [IQR 61- 67%], 6,255 Status 3 recipients with median benefit from transplant of 49%, [IQR 46- 53%], 11,000 Status 4 recipients with median benefit from transplant of 28%, [IQR 24- 31%], and 1,051 Status 6 recipients with median benefit from transplant of 14%, [IQR 10- 17%]. Whiskers represent smallest and largest observations within 1.5 times the IQR of the hinges, points represent outliers beyond this range. When re-classifying recipients from 2006-2015 based on new Status 1-6 system, 6,255 (56%) Status 1A recipients met Status 3 critieria, 1,254 Status 2 critieria (11%) and 255 met Status 1 criteria (2%). A total of 3,462 (31%) of Status 1A recipients would have been downgraded to Status 4 because of violation of the cardiogenic shock requirement at the time of transplant. All 7,250 Status 1B recipients were re-assigned to Status 4. Two-hundred and twenty-eight (22%) low priority Status 2 (three-status system) would have been assigned the higher Status 4 because of restrictive cardiomyopathy, congenital heart disease, hypertrophic cardiomyopathy, or amyloidosis. The recipients are the same in both the three-status and six-status models, however, the increased number of tiers in the six-tier model allows for wider variation in estimated survival benefits. Compared to the three-status system, the within-status standard deviation of five-year survival benefit decreased from 5.5% to 4.9%. The majority (66%) of within-status variation in survival benefit was still attributable to centers, with the remaining 34% attributable to variation in transplant year, waiting time, donor quality and ischemic time.
+
+
+\pagebreak
+
+# Text of Results Section
+
+## Basic demographics
+```{r join_cand_thor_demos, message= FALSE, warning=FALSE}
+
+#for eTable4
+cand_thor <- haven::read_sas("SAF 2018 Q3/cand_thor.sas7bdat", NULL) %>%  
+  haven::zap_formats() %>% haven::zap_labels() 
+
+
+
+init_lists <- to_model %>% group_by(PX_ID) %>%
+  filter(row_number()==1) %>% 
+  ungroup() %>% 
+  mutate(PX_ID = as.numeric(PX_ID)) %>%left_join(cand_thor, by = "PX_ID")
+
+mean_age <- mean(init_lists$CAN_AGE_AT_LISTING)
+
+pct_female <- 100*(init_lists %>% filter(CAN_GENDER == "F") %>% nrow())/(init_lists %>% nrow())
+```
+Of `r comma(init_lists %>% nrow())` candidates (mean age, `r comma_2(mean_age)`; `r comma_2(pct_female)`% women) listed at `r center_re %>% nrow()` centers.
+
+## Between-center Variation in the Survival Benefit Associated with Heart Transplantation
+
+```{r calculate_estimates}
+
+#population estimates
+
+##HR
+pop_mean_hr <- comma_2(mean(pop_tx_hz$hr))
+up_IQR_hr <- comma_2(quantile(pop_tx_hz$hr, probs = 0.75))
+low_IQR_hr <- comma_2(quantile(pop_tx_hz$hr, probs = 0.25))
+
+##five-year surival benefit
+mean_benefit <- comma_2(100*mean(pop_tx_hz$benefit, na.rm = TRUE))
+benefit_25 <- comma_2(100*quantile(pop_tx_hz$benefit, na.rm = TRUE, probs = 0.25))
+benefit_75 <- comma_2(100*quantile(pop_tx_hz$benefit, na.rm = TRUE, probs = 0.75))
+
+##five-year waitlist
+mean_wait <- comma_2(100*mean(pop_tx_hz$marginal_waits, na.rm = TRUE))
+wait_25 <- comma_2(100*quantile(pop_tx_hz$marginal_waits, na.rm = TRUE, probs = 0.25))
+wait_75 <- comma_2(100*quantile(pop_tx_hz$marginal_waits, na.rm = TRUE, probs = 0.75))
+
+
+
+##five-year post-transplant
+mean_post <- comma_2(100*mean(pop_tx_hz$marginal_posts, na.rm = TRUE))
+post_25 <- comma_2(100*quantile(pop_tx_hz$marginal_posts, na.rm = TRUE, probs = 0.25))
+post_75 <- comma_2(100*quantile(pop_tx_hz$marginal_posts, na.rm = TRUE, probs = 0.75))
+```
+
+
+Heart transplantation was associated with a mean `r comma_2(100*(1-as.numeric(pop_mean_hr)))`% decrease in mortality risk compared to waiting without transplant (hazard ratio `r pop_mean_hr`, interquartile range [IQR] `r low_IQR_hr`-`r up_IQR_hr`). This risk reduction generated a mean `r mean_benefit`% (IQR `r benefit_25`-`r benefit_75`%) absolute improvement in five-year survival, increasing from `r mean_wait`% (IQR `r wait_25`- `r wait_75`%) without transplant to `r mean_post`% (IQR `r post_25`-`r post_75`%) with transplant (full model results in **Table S2**).
+
+```{r percent_attributable_centers}
+
+#Calculate the within-status variation in the benefit under the three-status system
+B_model <- lmer(100*benefit ~  stat_1b + stat_2 + (1|center), data = pop_tx_hz)
+
+
+benefit_var <- as.data.frame(VarCorr(B_model)) 
+
+center_var <- filter(benefit_var, grp == "center")$vcov
+residual_var <- filter(benefit_var, grp == "Residual")$vcov
+
+tot_var <- center_var + residual_var
+
+sd_3 <- comma_2((tot_var)^(1/2))
+
+
+pct_variation_center <- comma_2(100*center_var/tot_var)
+
+pct_other <- comma_2(100*(1- center_var/tot_var))
+
+```
+
+```{r compare_high_vs_low_post}
+
+#difference and 95% CI
+
+
+diff_95ci <- function(x, y, w=NULL){
+  lm <- lm(y ~ x, weights = w)
+  diff <- comma_2(lm$coefficients[[2]])
+  confint(lm, level = 0.95)
+  low_ci <- comma_2(confint(lm, level = 0.95)[2,1])
+  up_ci <- comma_2(confint(lm, level = 0.95)[2,2])
+  
+  if (lm$coefficients[[2]]>0){
+    return(paste0("+", diff, "; 95% CI, ", low_ci, " to ", up_ci))
+  }
+  
+  paste0(diff, "; 95% CI, ", low_ci, " to ", up_ci)
+}
+
+
+diff_95ci_pct <- function(x, y, w=NULL){
+  lm <- lm(y ~ x, weights = w)
+  diff <- comma_2(100*lm$coefficients[[2]])
+  confint(lm, level = 0.95)
+  low_ci <- comma_2(100*confint(lm, level = 0.95)[2,1])
+  up_ci <- comma_2(100*confint(lm, level = 0.95)[2,2])
+  
+  if (lm$coefficients[[2]]>0){
+    return(paste0("+", diff, "%; 95% CI, ", low_ci, "% to ", up_ci, "%"))
+  }
+  
+  paste0(diff, "%; 95% CI, ", low_ci, "% to ", up_ci, "%")
+}
+
+
+high_low <- five_year_means %>% filter(sig_better ==1 | sig_worse ==1)
+
+high_improvement <- comma(100*summary(lm(mean_five_year ~ sig_better, 
+                                         data = high_low, 
+                                         weights = high_low$num_tx))$coefficients[,1][[2]])
+
+low_benefit <- five_year_means %>% filter(sig_worse ==1)
+
+low_wait <- comma(100*weighted.mean(low_benefit$mean_five_year_wait, 
+                                    low_benefit$num_tx))
+
+low_post <- comma(100*weighted.mean(low_benefit$mean_five_year_post, 
+                                    low_benefit$num_tx))
+
+low_B <- comma(100*weighted.mean(low_benefit$mean_five_year, 
+                                 low_benefit$num_tx))
+
+high_benefit <- five_year_means %>% filter(sig_better ==1)
+
+high_wait <- comma(100*weighted.mean(high_benefit$mean_five_year_wait, 
+                                     high_benefit$num_tx))
+
+high_post <- comma(100*weighted.mean(high_benefit$mean_five_year_post, 
+                                     high_benefit$num_tx))
+
+high_B <- comma(100*weighted.mean(high_benefit$mean_five_year, 
+                                  high_benefit$num_tx))
+
+
+post_high_low <- diff_95ci_pct(x = high_low$center_performance, 
+                               y = high_low$mean_five_year_post, 
+                               w = high_low$num_tx)
+
+wait_high_low <- diff_95ci_pct(x = high_low$center_performance, 
+                               y = high_low$mean_five_year_wait, 
+                               w = high_low$num_tx)
+
+surv_ben_high_low <- diff_95ci_pct(x = high_low$center_performance, 
+                                   y = high_low$mean_five_year, 
+                                   w = high_low$num_tx)
+
+```
+
+Adjusted for Status, candidate risk of death without transplant varied from `r comma_2(100*(1-min_int_exp))`% lower (relative HR `r comma_2(min_int_exp)`) to `r comma_2(100*(max_int_exp-1))`% greater (relative HR `r comma(max_int_exp)`) relative to the average center. The reduction in mortality risk from heart transplantation also varied significantly by center, from a maximum `r comma_2(100*(1-min_tx_exp))`% greater reduction in mortality (relative HR `r comma_2(min_tx_exp)`) to a minimum of `r comma_2(100*(max_tx_exp -1))`% lower reduction (relative HR `r comma(max_tx_exp)`) (**eFigure 2**). In combination, these center effects led to wide variation in the case-mix adjusted survival benefit of heart transplantation: the mean improvement in estimated five-year survival ranged from `r min_benefit`% to `r max_benefit`% by center, IQR [`r low_qrt_5`% - `r high_qrt_5`%] (**Figure 2**). For every 10% decrease in expected candidate five-year waitlist survival without transplantation, there was a `r pct_benefit_increase_per_neg_10`% increase in estimated survival benefit from heart transplant (95% CI `r ci_slope_wait_up`% to `r ci_slope_wait_low`%, **Figure 3A**). In contrast, there was no significant relationship between post-transplant survival and benefit (+`r pct_benefit_increase_post`%, 95% CI `r ci_slope_post_up`% to `r ci_slope_post_low`%) (**Figure 3B**).
+  
+  
+ 
+## Medical Urgency of Recipients at High and Low Survival Benefit Centers
+```{r candidate_characteristics_by_center_perform_rates, message=FALSE, warning= FALSE}
+
+#Status at transplant by center performance
+stat_by_benefit <- pop_tx_hz %>%
+  filter(tx ==1) %>%
+  left_join(five_year_means %>% select(center, center_performance)) %>%
+  filter(center_performance != "Average") %>%
+  mutate(center_performance = droplevels(center_performance),
+         six_status = factor(six_status, 
+                             labels = c("Status 1", "Status 2", "Status 3", "Status 4", "Status 6")))
+
+pct_1a_High <- comma_2(100*mean(filter(stat_by_benefit, center_performance == "High")$stat_1a))
+
+pct_1a_Low <- comma_2(100*mean(filter(stat_by_benefit, center_performance == "Low")$stat_1a))
+
+p_1a_by_center <- comma_p(summary(glm(data =stat_by_benefit, 
+                                      stat_1a ~ center_performance), 
+                                  family = binomial, link = logit)$coefficients[2,4])
+pct_1a_diff <- diff_95ci_pct(stat_by_benefit$center_performance, stat_by_benefit$stat_1a, w = NULL)
+
+
+
+#Calculate overtreatment fraction amongst non-cardiogenic shock candidates
+over_rates<- recips %>% left_join(five_year_means) %>% 
+  filter(six_status > 3 & center_performance != "Average") %>%
+  mutate(over_1a = ifelse(three_status == "Status 1A", 1, 0))
+
+
+over_low <- comma_2(100*mean(filter(over_rates, 
+                                    center_performance == "Low" & six_status >3)$over_1a))
+
+over_high <- comma_2(100*mean(filter(over_rates, 
+                                     center_performance == "High" & six_status >3)$over_1a))
+
+p_over <- comma_p(summary(glm(over_1a ~ center_performance, 
+                              data = over_rates, 
+                              family = binomial()))$coefficients[2,4])
+
+over_diff <- diff_95ci_pct(x = over_rates$center_performance, y = over_rates$over_1a, w = NULL)
+
+stat_by_benefit <- stat_by_benefit %>% 
+  mutate(stat_just = fct_recode(stat_just, 
+                                "Status 1A (MCS complication)" = "Status 1A - (MCS complication)"))
+
+
+#Status 1A characteristics
+stat_1a_recip_w_tx_hr <- stat_by_benefit %>% 
+  filter(three_status == "Status 1A") %>%
+  mutate(PX_ID = as.numeric(PX_ID)) %>% left_join(tx_hr, by = "PX_ID") %>%
+  mutate(Gender = factor(CAN_GENDER, levels = c("F", "M")),
+         Race = factor(CAN_RACE),
+         Race = fct_lump(Race, n = 3),
+        Race = fct_recode(Race,
+                          "White" = "8",
+                          "Black" = "16",
+                          "Hispanic" = "2000", 
+                          "Other" = "Other"),
+        Diagnosis = case_when(
+          CAN_DGN>999 & CAN_DGN<1007 ~ "Dilated cardiomyopathy, non-ischemic",
+          CAN_DGN == 1007 | CAN_DGN ==1200 ~ "Ischemic cardiomyopathy",
+          CAN_DGN>1048 & CAN_DGN< 1100 ~ "Restrictive cardiomyopathy",
+          TRUE ~ "Other"
+        ),
+        Diagnosis = factor(Diagnosis, 
+                           levels = c("Dilated cardiomyopathy, non-ischemic", 
+                                      "Ischemic cardiomyopathy", 
+                                      "Restrictive cardiomyopathy", 
+                                      "Other")),
+        Diabetes = case_when(
+          CAN_DIAB_TY>1 & CAN_DIAB_TY<6 ~ "History of DM",
+          CAN_DIAB_TY ==1 ~ "Non-diabetic",
+          TRUE ~ "Unknown"
+        ),
+        female_gfr = if_else(CAN_GENDER == "F", 0.742, 1),
+        black_gfr = if_else(Race == "Black", 1.21, 1),
+        eGFR = 175*((REC_CREAT)^(-1.154))*(REC_AGE_AT_TX^(-0.203))*female_gfr*black_gfr,
+        Renal_Function = case_when(
+          REC_DIAL == "Y" ~ "Dialysis",
+          eGFR >= 60 ~ "GFR >= 60 ml/min/1.73 m^2",
+          eGFR>= 30 ~ "GFR >= 30 & <60 ml/min/1.73 m^2",
+          eGFR < 30 ~ "GFR < 30 ml/min/1.73 m^2",
+          TRUE ~ "Unknown"
+        ),
+        Renal_Function = if_else(is.na(Renal_Function)==TRUE, "Unknown", Renal_Function),
+        body_surface_area = 0.007184*(REC_HGT_CM)^(0.725)*REC_WGT_KG^(0.425),
+        Cardiac_Index = as.numeric(REC_CARDIAC_OUTPUT/body_surface_area),
+        Functional_Status = case_when(
+          REC_FUNCTN_STAT == 1 | (REC_FUNCTN_STAT>2069) ~"Limited Impairment, 10-30%",
+          (REC_FUNCTN_STAT>2039 & REC_FUNCTN_STAT<2061) ~ "Moderate Impairment, 40-60%",
+          (REC_FUNCTN_STAT>2000 & REC_FUNCTN_STAT<2031) ~ "Severe Impairment, 70-100%",
+          TRUE ~ "Unknown"
+        ),
+        Functional_Status = ifelse(is.na(Functional_Status), "Unknown", Functional_Status),
+        severe_impairment = ifelse(Functional_Status == "Severe Impairment, 70-100%", 1, 0),
+        stat_1a_just = droplevels(stat_just),
+        acute_mcs = ifelse(stat_1a_just == "Status 1A (MCS for shock)", 1, 0),
+        lvad_comp = ifelse(stat_1a_just == "Status 1A (MCS complication)", 1, 0),
+        pcwp_15 = ifelse(REC_PCW_MEAN < 15, 1, 0),
+        pcwp_15 = ifelse(is.na(REC_PCW_MEAN), 0, pcwp_15),
+         blood_type = factor(
+           case_when(
+             CAN_ABO %in% c("A", "A1", "A2") ~ "A",
+             CAN_ABO %in% c("A1B", "A2B") ~ "AB",
+             TRUE ~ CAN_ABO)
+           ),
+        payor = case_when(
+          REC_PRIMARY_PAY %in% c(3,4,13) ~ "Medicare",
+          REC_PRIMARY_PAY ==2 ~ "Medicaid",
+          REC_PRIMARY_PAY == 1 ~ "Private",
+          TRUE ~ "Other"
+        )
+  )
+
+#PCWP < 15 
+pct_under_15_PCWP_high <- comma_2(100*mean(filter(stat_1a_recip_w_tx_hr, 
+                                            center_performance == "High")$pcwp_15, 
+                                     na.rm = TRUE))
+
+
+pct_under_15_PCWP_low <- comma_2(100*mean(filter(stat_1a_recip_w_tx_hr, 
+                                            center_performance == "Low")$pcwp_15, 
+                                     na.rm = TRUE))
+
+pcwp_15_diff <- diff_95ci_pct(x = stat_1a_recip_w_tx_hr$center_performance, 
+                              y = stat_1a_recip_w_tx_hr$pcwp_15)
+
+#PCWP Mean
+pct_REC_PCW_MEAN_High <- comma(mean(filter(stat_1a_recip_w_tx_hr, 
+                                           center_performance == "High")$REC_PCW_MEAN, 
+                                    na.rm = TRUE))
+
+pct_REC_PCW_MEAN_Low <- comma(mean(filter(stat_1a_recip_w_tx_hr, 
+                                          center_performance == "Low")$REC_PCW_MEAN, 
+                                   na.rm = TRUE))
+
+pcwp_mean_diff <-  diff_95ci(x = stat_1a_recip_w_tx_hr$center_performance, 
+                             y = stat_1a_recip_w_tx_hr$REC_PCW_MEAN)
+
+
+#functional impairment
+pct_severe_impairment_High <- comma_2(100*mean(filter(stat_1a_recip_w_tx_hr, 
+                                                      center_performance == "High")$severe_impairment, 
+                                               na.rm = TRUE))
+
+pct_severe_impairment_Low <- comma_2(100*mean(filter(stat_1a_recip_w_tx_hr, 
+                                                     center_performance == "Low")$severe_impairment, 
+                                              na.rm = TRUE))
+
+severe_impair_diff <- diff_95ci_pct(x =stat_1a_recip_w_tx_hr$center_performance, 
+                                    y =stat_1a_recip_w_tx_hr$severe_impairment)
+
+
+#acute MCS use
+pct_acute_mcs_High <- comma(100*mean(filter(stat_1a_recip_w_tx_hr, 
+                                              center_performance == "High")$acute_mcs, 
+                                       na.rm = TRUE))
+
+pct_acute_mcs_Low <- comma(100*mean(filter(stat_1a_recip_w_tx_hr, 
+                                             center_performance == "Low")$acute_mcs, 
+                                      na.rm = TRUE))
+
+
+acute_mcs_diff <- diff_95ci_pct(x = stat_1a_recip_w_tx_hr$center_performance, 
+                                y = stat_1a_recip_w_tx_hr$acute_mcs)
+
+
+#LVAD complications
+pct_lvad_comp_High <- comma_2(100*mean(filter(stat_1a_recip_w_tx_hr, 
+                                              center_performance == "High")$lvad_comp, 
+                                       na.rm = TRUE))
+
+pct_lvad_comp_Low <- comma_2(100*mean(filter(stat_1a_recip_w_tx_hr, 
+                                             center_performance == "Low")$lvad_comp, 
+                                      na.rm = TRUE))
+
+p_lvad_comp_by_center <- comma_p(summary(glm(data =stat_1a_recip_w_tx_hr, 
+                                             lvad_comp ~ center_performance, 
+                                             family = binomial))$coefficients[2,4])
+
+lvad_comp_diff <- diff_95ci_pct(x = stat_1a_recip_w_tx_hr$center_performance, 
+                                y = stat_1a_recip_w_tx_hr$lvad_comp)
+
+#center volume and benefit association
+volume_benefit_diff <- diff_95ci(x = five_year_means$num_tx, 
+                                 y = 100*100*five_year_means$mean_five_year)
+
+volume_wait_diff <- diff_95ci(x = five_year_means$num_tx, 
+                              y = 100*100*five_year_means$mean_five_year_wait)
+
+volume_post_diff <- diff_95ci(x = five_year_means$num_tx,
+                              y = 100*100*five_year_means$mean_five_year_post)
+
+
+lvad_rates <- to_model %>% 
+  filter(tx ==1) %>%
+  left_join(center_re %>% select(center, center_performance)) %>% 
+  filter(center_performance != "Average") %>% 
+  mutate(high_ben = ifelse(center_performance == "High", 1, 0))
+
+pct_lvad_high <- comma_2(100*mean(filter(lvad_rates, 
+                                              center_performance == "High")$cf_lvad, 
+                                       na.rm = TRUE))
+
+pct_lvad_low <- comma_2(100*mean(filter(lvad_rates, 
+                                              center_performance == "High")$cf_lvad, 
+                                       na.rm = TRUE))
+```
+
+
+Compared to average, `r num_high` centers (`r comma_2(100*num_high/nrow(center_re))`%) had significantly higher survival benefit and `r num_low` centers (`r comma_2(100*num_low/nrow(center_re))`%) had significantly lower benefit. At five-years, Status-adjusted post-transplant survival was similar at high and low-benefit centers (`r high_post`% vs. `r low_post`%, `r post_high_low`). However, estimated candidate survival without transplant was lower at high-benefit centers (`r high_wait`% vs `r low_wait`%, `r wait_high_low`), leading to a larger five-year survival benefit (`r high_B`% vs `r low_B`%, `r surv_ben_high_low`). Compared to low-benefit centers, high-benefit centers used Status 1A qualifying therapies less frequently  (`r pct_1a_High`% vs. `r pct_1a_Low`%, `r pct_1a_diff`, **Table S3**) and were less likely to treat candidates who did not meet hemodynamic requirements for cardiogenic shock with Status 1A qualifying IABPs or high-dose inotropes (`r over_high`% vs. `r over_low`%, `r over_diff`). At the time of transplant, Status 1A candidates at high benefit centers had higher pulmonary capillary wedge pressures (mean `r pct_REC_PCW_MEAN_High` vs. `r pct_REC_PCW_MEAN_Low` mmHg, `r pcwp_mean_diff` and percentage less than 15 mmHg `r pct_under_15_PCWP_high`% vs. `r pct_under_15_PCWP_low`%, `r pcwp_15_diff`), and worse functional status (`r pct_severe_impairment_High`% vs. `r pct_severe_impairment_Low`% with severe impairment requiring continuous hospitalization, (`r severe_impair_diff`) than low-benefit centers. High-benefit centers transplanted more recipients for acute hemodynamic decompensation requiring mechanical support (`r pct_acute_mcs_High`% vs. `r pct_acute_mcs_Low`%, `r acute_mcs_diff`) and used the "device-related complication" Status 1A justification significantly less often (`r pct_lvad_comp_High`% vs. `r pct_lvad_comp_Low`%, `r lvad_comp_diff`) (**Table S4**). At high benefit centers, `r pct_lvad_high`% of Status 1A recipients had a BTT LVAD at the time of transplant compared to`r pct_lvad_low`% of recipients at low benefit centers (`r diff_95ci_pct(lvad_rates$cf_lvad, lvad_rates$high_ben)`).  Across all centers, transplant volume was weakly associated with post-transplant survival (`r volume_post_diff`), however was not associated with either candidate urgency (`r volume_wait_diff`) or survival benefit (`r volume_benefit_diff`) (**Figure S4**).
+
+## The Association of Status and Survival Benefit in Three and Six-Tier Allocation Systems
+
+```{r status_switches, warning=FALSE, message=FALSE}
+#status switch table
+status_switch <- pop_tx_hz %>% left_join(pop_tx_hz_6_stat) %>%
+  group_by(six_status, three_status) %>% count() %>%
+  spread(key = three_status, value = n) %>%
+  mutate_all(funs(ifelse(is.na(.)==TRUE, 0, .)))
+
+tot_1as <- sum(status_switch$"Status 1A")
+
+tot_1bs <- sum(status_switch$"Status 1B")
+
+tot_2s <- sum(status_switch$"Status 2")
+```
+
+
+Under the prior three-status heart allocation system, the most common Status at transplant was 1A (N =11,227, 57%) and heart transplantation for a Status 1A candidate conferred a mean five-year survival benefit associated with 58%, (IQR 54- 62%). Status 1B was the next most common (N = 7,250, 37%) with a mean five-year survival benefit associated with transplant of 27%, (IQR 23- 31%). There were only 1,338 candidates at Status 2 at the time of transplant (7%) with mean five-year survival benefit associated with transplant of 14%, (IQR 10- 17%) (Figure 4A). Overall, within a given priority Status at transplantation, the standard deviation in five-year survival benefit was 5.5% with the majority (76%) of the variation amongst recipients attributable to center-level effects and the remaining 24% attributable to variation in transplant year, waiting time, donor quality and ischemic time.
+When retrospectively re-classifying recipients from 2006-2015 based on new Status 1-6 system, 6,255 Status 1A recipients met Status 3 criteria (56%), 1,254 met Status 2 criteria (11%), and 255 met Status 1 criteria (2%). A total of 3,462 (31%) of Status 1A recipients would have been downgraded to Status 4 because of a violation of the cardiogenic shock requirement at the time of transplant. All 7,250 Status 1B recipients were re-assigned to Status 4. Two-hundred and twenty eight (22%) low priority Status 2 (three-status system) recipients would have been assigned to the higher Status 4 because of restrictive cardiomyopathy, congenital heart disease, hypertrophic cardiomyopathy, or amyloidosis. (eTable5). Estimated five-year survival benefit associated with transplant ranged from of 68% (Status 1) to 14% (Status 6) (Figure 4B).
+Compared to the three-status system, the within-status standard deviation of five-year survival benefit decreased from 5.5% to 4.9% but the majority (66%) was still attributable to centers. The between-center variance in the survival benefit of transplant on the log hazard ratio scale transplant decreased from 0.161 to 0.115, corresponding to a reduction in the between-center variance of absolute five-year survival benefit from 23% to 16%. (eTable6).
+
+
+
+
+
+```{r pct_variation_center_under_six_stat}
+
+#Variation in log hazard of transplant in three and six-status models
+var_tx_3_stat <- VarCorr(three_status)$center[2,2]
+
+var_tx_6_stat <- VarCorr(six_status)$center[2,2]
+
+#within-status variation in the five-year survival benefit under the six-status system
+B_model_6 <- lmer(100*benefit_6 ~  factor(six_status) + (1|center), data = pop_tx_hz_6_stat)
+
+benefit_var_6 <- as.data.frame(VarCorr(B_model_6)) 
+
+center_var_6 <- filter(benefit_var_6, grp == "center")$vcov
+residual_var_6 <- filter(benefit_var_6, grp == "Residual")$vcov
+
+tot_var_6 <- center_var_6 + residual_var_6
+
+sd_6 <- comma_2((tot_var_6)^(1/2))
+  
+pct_variation_center_6 <- comma_2(100*center_var_6/tot_var_6)
+
+pct_other_6 <- comma_2(100*(1- center_var_6/tot_var_6))
+
+```
+
+When re-classifying recipients from 2006-2015 based on new Status 1-6 system, the majority (`r comma_2(100*filter(status_switch, six_status ==3)$"Status 1A"/tot_1as)`%) of Status 1A recipients would have been Status 3, with a smaller group qualifying for Status 2 (`r comma_1(100*filter(status_switch, six_status ==2)$"Status 1A"/tot_1as)`%) and very few meeting Status 1 criteria (`r comma_1(100*filter(status_switch, six_status ==1)$"Status 1A"/tot_1as)`%). A substantial portion (`r comma_2(100*filter(status_switch, six_status ==4)$"Status 1A"/tot_1as)`%) of Status 1A candidates would have been downgraded to Status 4 because of violation of the cardiogenic shock requirement. A small number of recipients (N = `r filter(status_switch, six_status ==4)$"Status 2"`) would have been assigned a higher status because of restrictive cardiomyopathy (**Table S5** for details). Five-year survival benefit from transplant ranged from of `r comma_2(filter(five_yr_by_six_status, six_status == 1)$mean)`% (Status 1) to `r comma_2(filter(five_yr_by_six_status, six_status == 6)$mean)`% (Status 6) (Figure 5B). 
+
+Compared to the three-status system, the within-status standard deviation of five-year survival benefit decreased from `r sd_3`% to `r sd_6`% but the majority  (`r pct_variation_center_6`%) was still attributable to centers. The between-center variance in the survival benefit of transplant on the log hazard scale decreased from `r comma(three_status_var)` to `r comma(six_status_var)` on log hazard ratio scale. The between-center variance in absolute 5-year survival benefit decreased from `r comma_2(center_var)`% to `r comma_2(center_var_6)`%.   (**Table S6**).
+
+\pagebreak
+
+# Supplement
+
+## Figure S1: Details of prior and current heart allocation system
+
+![](Fig_S1.png)
+
+Current and future adult heart allocation. Schematic depiction of the shift from the current adult heart allocation system to the modified system. \* Cardiogenic shock requirement applies. (Constructed with permission directly from the policy details in Organ Procurement and Transplantation Network1). Complete detail about each of the Status criteria are available at https://optn.transplant.hrsa.gov/media/1200/optn_policies.pdf#nameddest=Policy_06.  Dischargeable vs. non-dischargeable ventricular support devices were distinguished via a list provided by the SRTR.
+
+
+## eFigure 2: Center-specific Survival Benefit Framework
+```{r combined_survival_benefit_example, warning=FALSE, message= FALSE}
+#Survival benefit from transplantation for a Status 1A patient 
+#transplanted at a center with a high benefit from transplant
+top_c <- center_re %>% arrange(-benefit) %>% filter(row_number()==1)
+top_c_tx_hr <- top_c$tx_exp
+top_c_wt_risk <- top_c$intercept_exp
+top_c <- top_c$center
+
+best_ctr_recips <- unique(to_model %>% filter(center == top_c) %>% 
+                            select(PX_ID)) %>% 
+  left_join(to_model %>% select(PX_ID, tx, stat_1a, t_1, era_tx) %>% 
+              group_by(PX_ID, tx) %>% 
+              filter(tx ==1 & row_number() ==1)) %>% 
+  filter(is.na(tx) == FALSE)
+
+ex_pt_top <- best_ctr_recips[[156, "PX_ID"]]
+
+t_tx <- best_ctr_recips[[156, "t_1"]]
+
+hz_good <- exp(hr_tx_ij(model = three_status, 
+                        df = to_model, i = top_c, j = ex_pt_top))
+
+max_fup <- max(basehz$time)/365
+
+ex_benefit <- ben_wait_tx(df = to_model, 
+                          base_hz = basehz, 
+                          model = three_status, j = ex_pt_top, i = top_c)
+fiveyr_good <- comma_2(100*(ex_benefit[[2]]-ex_benefit[[1]]))
+fiveyr_good_wait <- comma_2(100*ex_benefit[[1]])
+fiveyr_good_tx <- comma_2(100*ex_benefit[[2]])
+
+good_plot <- b_ij(df = to_model, base_hz = basehz, model = three_status, j = ex_pt_top, i = top_c) + 
+ scale_x_continuous(limits = c(0, 5*365), breaks= seq(0, t_tx + 5*365, 365)) + 
+  scale_y_continuous(breaks= seq(0, 1, 0.2)) + 
+  theme_economist_white() + 
+  theme(axis.title = element_text(), 
+        axis.title.y = element_text(), 
+        legend.position="bottom", 
+        legend.key = element_rect(fill = "white"), 
+        legend.background = element_rect(fill = "white"), 
+        legend.text = element_text(size = 12))
+
+
+### Figure 2B: Survival benefit from transplantation for a "Status 1A" patient 
+#transplanted at a center with a lower benefit from transplant
+worst_c <- center_re %>% arrange(benefit) %>% filter(row_number()==1)
+worst_c_tx_hr <- worst_c$tx_exp
+worst_c_wt_risk <- worst_c$intercept_exp
+worst_c <- worst_c$center
+
+worst_c_recips <- unique(to_model %>% 
+                           filter(center == worst_c) %>% 
+                           select(PX_ID)) %>% 
+  left_join(to_model %>% select(PX_ID, tx, stat_1a, t_1, era_tx) %>% 
+              group_by(PX_ID, tx) %>% 
+              filter(tx ==1 & row_number() ==1)) %>% 
+  filter(is.na(tx) == FALSE)
+
+ex_worst <- worst_c_recips[[30,"PX_ID"]]
+
+t_tx_worst <- worst_c_recips[[30,"t_1"]]
+
+ex_benefit_bad <- ben_wait_tx(df = to_model, 
+                              base_hz = basehz, 
+                              model = three_status,  
+                              i = worst_c, 
+                              j = ex_worst) 
+
+fiveyr_bad <- comma_2(100*(ex_benefit_bad[[2]]-ex_benefit_bad[[1]]))
+fiveyr_bad_wait <- comma_2(100*ex_benefit_bad[[1]])
+fiveyr_bad_tx <- comma_2(100*ex_benefit_bad[[2]])
+
+hz_bad <- exp(hr_tx_ij(model = three_status, df = to_model, i = worst_c, j = ex_worst))
+
+
+bad_plot <- b_ij(df = to_model, 
+                 base_hz = basehz, 
+                 model = three_status,  
+                 i = worst_c, j = ex_worst)+
+  scale_x_continuous(limits = c(0, 5*365), 
+                     breaks= seq(0, t_tx_worst + 5*365, 365)) + 
+  scale_y_continuous(breaks= seq(0, 1, 0.2)) + 
+  theme_economist_white() + 
+  theme(axis.title = element_text(),
+        axis.title.y = element_text(), legend.position="right")
+
+
+#combine plots
+g_legend<-function(a.gplot){
+  tmp <- ggplot_gtable(ggplot_build(a.gplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)}
+
+
+mylegend <- g_legend(good_plot)
+
+
+fig_2 <- grid.arrange(
+                      arrangeGrob(good_plot + theme(legend.position="none"),
+                         bad_plot + theme(legend.position="none", 
+                                          axis.title.y = element_blank(), 
+                                          axis.text.y = element_blank()),
+                         nrow=1, widths = c(1, 0.9)),
+                      mylegend, 
+             nrow=2,heights=c(10, 2.2)) 
+
+ggsave("efig_2.pdf", plot = fig_2)
+```
+Two example survival benefit predictions incorporating the timing of transplantation, candidate status, donor quality, ischemic time, and year of transplant. 
+
+The high-benefit center (Panel A) prioritizes Status 1A candidates at higher risk of wait-list mortality and transplantation at this center lowers risk more than average. Specifically, candidates listed by this center have a risk of death `r comma_2((top_c_wt_risk-1)*100)`% higher than the average center (relative HR `r comma(top_c_wt_risk)`) and transplant lowers the risk of mortality `r comma_2(100*(1-top_c_tx_hr))`% more than at the average center (HR `r comma_2(top_c_tx_hr)`). The combination of these two effects leads to a large 5-year survival benefit, improving survival (conditional upon reaching transplant) from `r fiveyr_good_wait`% to `r fiveyr_good_tx`% (+`r fiveyr_good`% absolute gain) for this particular Status 1A patient transplanted after waiting `r t_tx` days.
+
+In contrast, the patients transplanted at the low-benefit center (Panel B) are at lower risk of dying on the waitlist at baseline and transplantation at this center lowers risk less than average. Specifically, candidates listed by this center have a risk of death `r comma_2((1-worst_c_wt_risk )*100)`% lower than the average center (HR `r comma_2(worst_c_wt_risk)`) and transplant lowers the risk of mortality `r comma_2(100*(worst_c_tx_hr-1))`% less than at the average center (HR `r comma(worst_c_tx_hr)`). Despite the fact that the candidate has the same priority Status as the candidate in Panel A, the combination of these two effects leads to a smaller 5-year survival benefit, improving survival from  `r fiveyr_bad_wait`% to `r fiveyr_bad_tx`% (+`r fiveyr_bad`% absolute gain) for transplanted after waiting `r t_tx_worst` days.
+
+\pagebreak
+
+
+
+## Table S2: Three-status `coxme` results
+```{r three_status_display}
+print(three_status, digits =2)
+```
+
+### 95% Confidence Intervals of coefficients
+```{r table_fe_results}
+table_fe_results <- function(me_cox_1){
+  fe_results_table <- tibble(covariate = character(), 
+                             `log hazard ratio` = character(),
+                             `95% CI` = character())
+  fe <- fixef(me_cox_1)
+  vc <- vcov(me_cox_1)
+  for (i in seq_along(fe)){
+    name <- names(fe[i])
+    hr <- comma(unname(fe[i]))
+    se <- sqrt(vc[i,i])
+    ci <- paste0("(", comma(unname(fe[i]) - 1.96*se), 
+                 ", ", 
+                 comma(unname(fe[i]) + 1.96*se), ")")
+    fe_results_table <- rbind(fe_results_table, 
+                              tibble(covariate =name, 
+                                     `log hazard ratio` = hr, 
+                                     `95% CI` = ci))
+  }
+  return(fe_results_table)
+}
+
+table_fe_results(three_status)
+
+#write_csv(table_fe_results(three_status), "three_status_fixed.csv")
+```
+
+
+```{r plot_tx_effect_by_status, echo = FALSE}
+plot_tx_effects <- function(model){
+  to_plot <- tibble(covariate = character(), 
+                    haz = numeric(), 
+                    low_ci = numeric(), 
+                    up_ci = numeric())
+  vc <- vcov(model)
+  fe <- fixef(model)
+  tx_1a <-  fixef(model)['tx']
+  
+  for (i in seq_along(fe)){
+    name <- names(fe[i])
+    if(grepl("tx", name) == TRUE){
+      if (name == "tx"){
+        hr <- exp(unname(fe[i]))
+        se <- sqrt(vc[i,i])
+        lci <- exp(unname(fe[i])- 1.96*se)
+        uci <- exp(unname(fe[i])+ 1.96*se)
+        to_plot <- rbind(to_plot, 
+                         tibble(covariate =name, 
+                                haz = hr, 
+                                low_ci = lci, 
+                                up_ci = uci))
+      }
+      else{
+        hr <- exp(unname(fe[i])+ tx_1a)
+        se <- sqrt(vc[i,i] + vc[1,1] + 2* vc[1,i])
+        lci <- exp(unname(fe[i])+ tx_1a - 1.96*se)
+        uci <- exp(unname(fe[i])+ tx_1a + 1.96*se)
+        to_plot <- rbind(to_plot, tibble(covariate =name, 
+                                         haz = hr, 
+                                         low_ci = lci, 
+                                         up_ci = uci))
+      }
+
+    }
+  }
+  
+
+  return(to_plot)
+}
+
+```
+
+```{r plot_three_status, message=FALSE}
+
+to_plot <- plot_tx_effects(three_status) %>% 
+  mutate(`Patient Status` = factor(covariate, 
+                                   levels = c("tx", 
+                                              "tx:stat_1b", 
+                                              "tx:stat_2", 
+                                              "tx_risky_don",
+                                              "era_tx"), 
+                                   labels =  c("Status 1A", 
+                                               "Status 1B", 
+                                               "Status 2",
+                                               "High risk donor (Status 1A recipient)", 
+                                               "Before 2010 (Status 1A recipient)"))) %>% 
+  arrange(factor(covariate, 
+                 levels = c("tx","tx:stat_1b", "tx:stat_2", "tx_risky_don","era_tx")))
+
+ggplot(data = to_plot %>% 
+         filter(!covariate %in% c("tx_risky_don","era_tx")), 
+       aes(y = `Patient Status`, x = haz)) + 
+  geom_point() + 
+  geom_errorbarh(aes(xmin = low_ci, xmax = up_ci)) + 
+  theme_fivethirtyeight() + 
+  theme(axis.title = element_text(), axis.title.y = element_blank()) + 
+  scale_x_continuous(limits = c(0,1), 
+                     breaks = c(0, 0.25, 0.5, 0.75, 1),  
+                     name = "Benefit heart transplantation (HR for Death)" )
+
+
+tx_est <- comma_2(filter(to_plot, covariate == "tx")$haz)
+tx_low <-comma_2(filter(to_plot, covariate == "tx")$low_ci)
+tx_up <- comma_2(filter(to_plot, covariate == "tx")$up_ci)
+
+
+stat_1b_est <- comma_2(filter(to_plot, covariate == "tx:stat_1b")$haz)
+stat_1b_low <-comma_2(filter(to_plot, covariate == "tx:stat_1b")$low_ci)
+stat_1b_up <- comma_2(filter(to_plot, covariate == "tx:stat_1b")$up_ci)
+
+
+stat_2_est <- comma_2(filter(to_plot, covariate == "tx:stat_2")$haz)
+stat_2_low <-comma_2(filter(to_plot, covariate == "tx:stat_2")$low_ci)
+stat_2_up <- comma_2(filter(to_plot, covariate == "tx:stat_2")$up_ci)
+
+ggsave("HR_transplant_model_1.pdf")
+
+```
+Hazard ratios of transplantation in the old 3-status system at transplantation as estimated by mixed-effects model, adjusted for donor risk, ischemic time, and year of transplant (see supplement for full model results).
+
+Status 1A candidates had a hazard ratio of transplant `r tx_est` (95% CI `r tx_low`-`r tx_up`), Status 1B candidates had a HR of `r stat_1b_est` (95% CI `r stat_1b_low`-`r stat_1b_up`) and Status 2 candidates had a HR of `r stat_2_est` (95% CI `r stat_2_low`-`r stat_2_up`). 
+
+## Figure S2: Smoothed baseline hazard function from time of listing
+```{r baseline_hazard, warning=FALSE, message= FALSE}
+
+ggplot(data = basehz, aes(x=time/365, y = hz_t)) + 
+  geom_smooth() + 
+  labs(y = "Hazard") + 
+  scale_x_continuous(name = "Years after listing", limits = c(0, 12), breaks = seq(0, 12, 2))
+
+ggsave("base_hazard.pdf")
+```
+This baseline hazard function used to calculating the 5-year benefit was estimated non-parametrically using a kaplan-meier estimate. Immediately after listing for heart transplantation, candidates have increased hazard of death. More than 5 years after listing the hazard begins to rise again due to aging. 
+
+
+##Figure S3: Distribution of Survival Benefit at the Best and Worst Center, 2006-2015
+```{r plot_best_worst_5_yr_sum, message= FALSE, warning=FALSE}
+best_center <- paste0(as.character(
+  five_year_means[five_year_means$mean_five_year ==max(five_year_means$mean_five_year),]$center), ".x")
+
+worst_center <- paste0(as.character(
+  five_year_means[five_year_means$mean_five_year ==min(five_year_means$mean_five_year),]$center), ".x")
+
+to_plot <- ben_five_year_only %>% select(best_center, worst_center) %>% 
+  gather(key = center, value = five_year_benefit) %>% 
+  mutate(ctr = if_else(center == best_center, "Best Center", "Worst Center"))
+
+best_ctr_mean <- comma_2(
+  100*mean(filter(to_plot, ctr == "Best Center")$five_year_benefit, na.rm = TRUE))
+
+worst_ctr_mean <- comma_2(
+  100*mean(filter(to_plot, ctr == "Worst Center")$five_year_benefit, na.rm =TRUE))
+
+ggplot(to_plot, aes(x = five_year_benefit*100, fill = ctr)) + 
+  geom_density(alpha = 0.5) + 
+  scale_x_continuous(limits =  c(-25, 100), name = "5-year survival benefit (%)") +
+  scale_fill_manual(values = c("blue", "red")) + 
+  guides(fill = guide_legend(""))
+
+ggsave("fig_S4.pdf")
+```
+Distribution of 5-year survival benefit if the best and worst center hypothetically had transplanted all recipients during the study time period.  The best center had a mean five year survival benefit of `r best_ctr_mean`% compared to only `r worst_ctr_mean`% at the lowest benefit center.
+
+## Table S3: Status at heart transplantation by center level of benefit
+```{r status_at_transplant_by_benefit, message=FALSE, warning= FALSE, results = 'asis'}
+tangram::rmd(tangram::tangram("center_performance ~ three_status + six_status", stat_by_benefit, digits = 3))
+```
+
+## Table S4: Status 1A recipient characteristics at time of transplant by center benefit
+
+```{r recip_characteristics, message=FALSE, warning=FALSE, results = 'asis'}
+#Label Variables when necessary
+Hmisc::label(stat_1a_recip_w_tx_hr$Cardiac_Index) <- "Cardiac Index (L/min/m^2)"
+Hmisc::label(stat_1a_recip_w_tx_hr$REC_PCW_MEAN) <- "Mean Pulmonary Capillary Wedge Pressure (mmHg)"
+
+Hmisc::label(stat_1a_recip_w_tx_hr$stat_1a_just) <- "Status 1A Justification at Transplant"
+
+tangram::rmd(tangram::tangram("center_performance ~ benefit + marginal_posts + marginal_waits +  t_1 + REC_AGE_AT_TX + REC_BMI + Gender + Race + Diagnosis + Diabetes + Renal_Function + Functional_Status + Cardiac_Index + REC_PCW_MEAN + stat_1a_just + payor", data = stat_1a_recip_w_tx_hr))
+```
+For continuous variables, median and IQRs are presented and group comparison testing p-values obtained using Kruskal-Wallis. For categorical variables, number (%) are presented and group comparison testing p-values calculated with Pearson Chi-squared test. GFR = Glomerular Filtration Rate, calculated by the Modification in Diet in Renal Disease (MDRD) formula. Body surface area for cardiac index calculated with method of Du Bois. Functional status is on the Karnofsky scale.
+
+
+## Table S5 – Classification of heart transplant recipients from 2006-2015 based on the new Status 1-6 system.
+```{r status_shift, message=FALSE, warning=FALSE, results = 'asis'}
+tangram::rmd(tangram::tangram(data = stat_by_benefit, three_status~ six_status))
+```
+Classification of recipients from 2006-2015 based on new Status 1-6 system.  The majority ( `r comma_2(100*filter(status_switch, six_status ==3)$"Status 1A"/tot_1as)`%) of Status 1A recipients were coded as Status 3. A substantial portion (`r comma_2(100*filter(status_switch, six_status ==4)$"Status 1A"/tot_1as)`%) of Status 1A candidates would have been downgraded to Status 4 because of violation of the cardiogenic shock requirement. A small number of recipients `r filter(status_switch, six_status ==4)$"Status 2"` were assigned a higher status because of restrictive cardiomyopathy
+
+##Figure S4: Association of center transplant volume with wait-list survival, post-transplant survival, and survival benefit from heart transplantation. 
+```{r figure_S4_summary, message=FALSE}
+to_plot <- five_year_means %>%
+  select(num_tx, mean_five_year, mean_five_year_post, mean_five_year_wait) %>%
+  gather(key, value, -num_tx) %>%
+  mutate( key = case_when(
+    key == "mean_five_year" ~ "survival benefit",
+    key == "mean_five_year_wait" ~ "waitlist survival",
+    key == "mean_five_year_post" ~ "post-transplant survival"
+  )
+  )
+
+ggplot(to_plot, aes(x = num_tx, y = 100*value, color = key, group = key)) + 
+  geom_point( size = 3) + geom_smooth( method = "lm") +
+  scale_color_brewer(palette = "Set1", direction = -1 ) +
+  labs(y = "Five-year estimate (%)",  
+       x = "Number of Transplants performed during study time period", 
+       color = "") + 
+  ylim(0, 100)
+
+ggsave("Fig_S4.pdf")
+```
+Across all centers, transplant volume was weakly associated with post-transplant survival (`r volume_post_diff`), however was not associated with either candidate urgency (`r volume_wait_diff`) or survival benefit (`r volume_benefit_diff`) (**Figure S4**).
+
+## Table S6: Six-status `coxme` results
+```{r six_status_display}
+print(six_status, digits = 2)
+```
+### 95% Confidence Intervals of coefficients
+```{r 95_ci_six_status}
+#write_csv(table_fe_results(six_status), "six_status_fixed.csv")
+table_fe_results(six_status)
+```
+
+
+```{r plot_6_status, message = FALSE}
+to_plot <- plot_tx_effects(six_status) %>% 
+  mutate(`Patient Status` = factor(covariate, 
+                                   levels = c("tx",
+                                              "tx:status_2", 
+                                              "tx:status_3", 
+                                              "tx:status_4", 
+                                              "tx:status_6", 
+                                              "tx_risky_don","era_tx"), 
+                                   labels =  c("Status 1", 
+                                               "Status 2", 
+                                               "Status 3", 
+                                               "Status 4", 
+                                               "Status 6", 
+                                               "High risk donor (Status 1 recipient)", 
+                                               "Before 2010 (Status 1 recipient)")))
+
+ggplot(data = to_plot %>% 
+         filter(!(covariate %in% c("tx_risky_don","era_tx"))), 
+       aes(y = `Patient Status`, x = haz)) + 
+  geom_point() + 
+  geom_errorbarh(aes(xmin = low_ci, xmax = up_ci))  + 
+  scale_x_continuous(limits = c(0,0.75), breaks = c(0, 0.25, 0.5, 0.75),  
+                     name = "Hazard Ratio for death relative to waiting") +
+  theme_fivethirtyeight() + 
+  theme(axis.title = element_text(), 
+        axis.title.y = element_blank(),
+        axis.title.x = element_text(vjust = 0.1))
+
+stat_list <- c("status_1", "status_2", "status_3", "status_4", "status_6")
+
+tx_estimates <- tibble(status = stat_list) %>%
+  mutate(
+    hazard = "",
+    low_ci = "", 
+    up_ci = ""
+  )
+
+i <- 1
+for (s in stat_list) {
+  
+  if (s == "status_1"){
+    int <- "tx"
+  }
+  else{
+    int <- paste0("tx:", s)
+  }
+  
+  tx_estimates$hazard[i] <-comma_2(filter(to_plot, covariate == int)$haz)
+  
+  tx_estimates$low_ci[i] <-comma_2(filter(to_plot, covariate == int)$low_ci)
+  
+  tx_estimates$up_ci[i] <-comma_2(filter(to_plot, covariate == int)$up_ci)
+  
+  i <- i + 1
+}
+
+ggsave("HR_transplant_six_status.pdf")
+```
+Hazard ratios of transplantation by 6-Status Justification at transplantation as estimated by mixed-effects model, adjusted for donor risk, ischemic time, and year of transplant (see supplement for full model results).
+
+Hazard ratios of transplantation conditional Status at transplantation as estimated by mixed-effects model (see supplement for full model results). Status 1 candidates had hazard ratio of transplant of `r filter(tx_estimates, status == "status_1")$hazard` (95% CI `r filter(tx_estimates, status == "status_1")$low_ci`-`r filter(tx_estimates, status == "status_1")$up_ci`). Compared to this group, Status 2-6 candidates had significantly lower benefit from heart transplanation. 
+
+Status 2 had a hazard ratio of `r filter(tx_estimates, status == "status_2")$hazard` (95% CI `r filter(tx_estimates, status == "status_2")$low_ci`-`r filter(tx_estimates, status == "status_2")$up_ci`), Status 3 `r filter(tx_estimates, status == "status_3")$hazard` (95% CI `r filter(tx_estimates, status == "status_3")$low_ci`-`r filter(tx_estimates, status == "status_3")$up_ci`), Status 4 `r filter(tx_estimates, status == "status_4")$hazard` (95% CI `r filter(tx_estimates, status == "status_4")$low_ci`-`r filter(tx_estimates, status == "status_4")$up_ci`), and Status 6 `r filter(tx_estimates, status == "status_6")$hazard` (95% CI `r filter(tx_estimates, status == "status_6")$low_ci`-`r filter(tx_estimates, status == "status_6")$up_ci`)
+
+
+# Sensitivity analyses
+
+## Fixed effects sensitivity analysis
+
+Here we fit the model
+
+$h(t) = h_0(t)exp(center + status + tx*(center + status + donrisk + txYear)$
+
+```{r fixed_effects_model}
+
+num_tx_by_center <- to_model %>%
+  filter(dead ==1) %>%
+  group_by(center) %>%
+  count()
+
+#center 602 is close to the "mean" center
+for_fe <- to_model %>%
+  left_join(num_tx_by_center, by = "center") %>%
+  filter(n>20) %>%
+  mutate(three_status = factor(three_status),
+         center = factor(center),
+         center = relevel(center, ref = "602"))
+  
+full_fe <- "Surv(t_1, t_2, dead) ~ tx*(three_status + center) + tx_risky_don + era_tx"
+
+full_fe_model <- coxph(as.formula(full_fe), for_fe)
+
+centers_exlcuded <-  length(unique(to_model$center)) - length(levels(for_fe$center))
+```
+
+This model treats center as a *fixed* effect. To get this model to converge, we excluded `r centers_exlcuded` centers with less than 20 deaths (before or after transplant)
+
+```{r table_out_fe_model, include = FALSE}
+fe_table_out <- function(model){
+
+  covariates <- names(model$coefficients)
+  
+  sum_fe_model <- summary(model)$coefficients
+  
+  betas <- unname(sum_fe_model[,1])
+  se <- unname(sum_fe_model[,3])
+  
+  covariates
+ tibble(covariate = covariates,
+        `log hazard ratio` = betas,
+        se = se) %>%
+    mutate(low_ci = `log hazard ratio` - 1.96*se,
+           up_ci = `log hazard ratio` + 1.96*se) %>%
+   select(-se)
+  
+}
+
+
+write.csv(fe_table_out(full_fe_model), "center_fe_model.csv")
+```
+
+```{r print_fe_model}
+print(full_fe_model, digits = 2)
+```
+
+```{r transplant_fixed_effects_by_center}
+sum_fe_model <- summary(full_fe_model)$coefficients
+
+tx_1a <- sum_fe_model[1,1]
+  
+fe_coef <- tibble(name = names(full_fe_model$coefficients), 
+                  beta = unname(sum_fe_model[,1])) %>%
+  filter(grepl( "center",name)== TRUE) %>%
+  mutate(tx = ifelse(grepl( "tx:",name), "transplant", "waitlist"),
+         center = numextract(name)) %>%
+  select(-name) %>%
+  spread(tx, beta)
+  
+vcov_full_fe <- vcov(full_fe_model)
+
+tx_wait_cov <- vector("double", length = length(unique(for_fe$center)))
+center_ids <- vector("double", length = length(unique(for_fe$center)))
+wait_variance <- vector("double", length = length(unique(for_fe$center)))
+tx_variance <- vector("double", length = length(unique(for_fe$center)))
+i <- 1
+j <- 1
+for (n in names(vcov_full_fe[,1])){
+  if (grepl("center", n) == TRUE & grepl("tx", n) == FALSE){
+    tx_effect <- paste0("tx:",n)
+    tx_wait_cov[[i]] <- vcov_full_fe[[tx_effect,n]]
+    
+    wait_variance[[i]] <- vcov_full_fe[[n,n]]
+    center_ids[[i]] <- numextract(n)
+    i <- i + 1
+  }
+  if (grepl("tx:center", n) == TRUE){
+    tx_variance[[j]] <- vcov_full_fe[[n, n]]
+    j <- j + 1
+  }
+}
+
+tx_wait_cov <- tibble(center = center_ids, 
+                      wait_variance = wait_variance, 
+                      tx_variance = tx_variance, 
+                      covariance = tx_wait_cov)
+
+
+fe_coef <- fe_coef %>%
+  left_join(tx_wait_cov) %>%
+  mutate(tx_benefit =  transplant - waitlist) %>%
+  arrange(-tx_benefit) %>%
+  mutate(id = row_number())
+```
+
+
+### Histogram of center relative survival benefits
+```{r histogram_fe, warning = FALSE, message=FALSE}
+ggplot(fe_coef, aes(x = tx_benefit)) + geom_histogram(breaks = seq(-3, 2, 0.25))
+  labs(x = "center effect on benefit of transplant\n(log hazard ratio of transplant (Status 1A)", 
+       y = "number of centers") +
+  theme_few()
+
+ggsave("eFigure6.pdf")
+
+s_w_norm_test <- comma_2(shapiro.test(fe_coef$tx_benefit)[[2]])
+```
+Distribution of center-specific survival benefits for a Status 1A recipient, calculated by subtracting the log hazard of waitlist from the the log hazard of transplant at the center. The shapiro-wilk test for non-normality was not significant (p = `r s_w_norm_test`). The variance of the survival benefit of transplant was `r comma(var(fe_coef$tx_benefit))` on log hazard ratio scale, `r comma_2(100*(three_status_var-var(fe_coef$tx_benefit))/three_status_var)`% lower than the three-status model.
+
+
+$benefit = \beta_{tx, i} - \beta_{wait, i}$
+
+
+## Relationship between fixed-effect and random-effect center estimates of survival benefit from heart transplantation.
+```{r fe_vs_re_plot, warning = FALSE, message = FALSE}
+
+for_spear <- center_re %>%
+  filter(center %in% fe_coef$center) %>%
+  left_join(fe_coef %>% select(center, tx_benefit))
+
+spearman_cor <- cor(for_spear$benefit, for_spear$tx_benefit,method = "spearman")
+
+ggplot(for_spear, aes(x = benefit, y = tx_benefit)) + geom_point() +
+  labs( x = "benefit of transplant (RE estimate) log hazard", 
+        y = "benefit of transplant (FE estimate) log hazard")
+
+ggsave("eFig7.pdf")
+```
+Scatter plot of center fixed-effect (y-axis) and random-effect (x-axis) estimates of the survival benefit of heart transplantation (on log hazard scale). A spearman correlation between the two was `r spearman_cor`
+
+
+
+### Association of center waitlist risk with survival benefit from transplantation 
+```{r eFig_8,  warning = FALSE, message = FALSE}
+
+ggplot(fe_coef, aes(x = waitlist, y = tx_benefit)) + geom_point(size = 2.5, alpha = 0.9) +
+  labs(x = "Waitlist relative risk (log hazard)", 
+       y = "Relative benefit of transplant (log hazard)") +
+  geom_line(aes(linetype = "Mean Center"), 
+            y = 0, color = "black") + 
+  scale_linetype_manual(values = "dashed") 
+
+
+slope_fe <- lm(tx_benefit ~ waitlist, data = fe_coef)
+
+slope_pct_fe <- comma_2(slope_fe$coefficients[[2]])
+
+ci_slope_fe_wait_low <- comma_2(10*-confint(slope_fe, 'waitlist', level=0.95)[1,1])
+
+ci_slope_fe_wait_up <- comma_2(10*-confint(slope_fe, 'waitlist', level=0.95)[1,2])
+
+ggsave("eFigure8.pdf")
+```
+The association between estimated log hazard of death on waitlist at a given center (x-axis) and log hazard survival benefit (y-axis). A linear association is observed, for every one unit increase in the log hazard of waitlist risk the log hazard of transplant decreased `r slope_pct_fe` (95% CI `r ci_slope_fe_wait_low` - `r ci_slope_fe_wait_up`).
+
+## Alternative ME models
+```{r data_in_revision}
+to_model <- read.csv("clean_time_series_revise2006_2015.csv") %>%
+  mutate(
+  	ischemia = case_when(
+			REC_HR_ISCH/60 < 2 ~ 1,
+			REC_HR_ISCH/60 >= 2 & REC_HR_ISCH/60 < 4 ~ 2,
+			REC_HR_ISCH/60 >=4 & REC_HR_ISCH/60 < 6 ~ 3,
+			REC_HR_ISCH/60 >= 6 & REC_HR_ISCH/60 < 8 ~4,
+			TRUE ~ 5
+  	),
+don_age = factor(case_when(
+			DON_AGE >=40 & DON_AGE <50 ~ "30-50",
+			DON_AGE >= 50 ~ "> 50",
+			TRUE ~ "< 30"
+		)),
+don_renal_function = 
+		case_when(
+			(DON_BUN/DON_CREAT) > 30 ~ 1,
+			TRUE ~ 0
+		),
+race_mismatch = 
+		case_when(
+			black != black_don ~ 1,
+			TRUE ~ 0
+		)
+	)
+```
+
+
+
+### ME sensitivity analyses
+
+
+1. better_donor_year <- "Surv(t_1, t_2, dead) ~ tx*(stat_2 + stat_1b + factor(list_year)) + don_renal_function + don_age + race_mismatch + ischemia"
+
+
+2. six-status, donor quality and transplant year
+better_donor_year_candidate <- "Surv(t_1, t_2, dead) ~ tx*(stat_2 + stat_1b + factor(list_year) + age + female + bmi_low + bmi_high + simple_diag + cross_match +blood_type) + don_renal_function + don_age + race_mismatch + ischemia"
+
+
+3. three status, region & LVAD
+region_lvad <- "Surv(t_1, t_2, dead) ~ tx*(stat_2 + stat_1b + factor(REGION) + cf_lvad) + tx_risky_don + era_tx"
+
+```{r formulas_models_sens}
+#three-status, donor quality, and transplant year
+better_donor_year <- "Surv(t_1, t_2, dead) ~ tx*(stat_2 + stat_1b + factor(list_year)) + don_renal_function + don_age + race_mismatch + ischemia"
+
+
+#six-status, donor quality and transplant year
+better_donor_year_candidate <- "Surv(t_1, t_2, dead) ~ tx*(stat_2 + stat_1b + factor(list_year) + age + female + bmi_low + bmi_high + simple_diag + cross_match +blood_type) + don_renal_function + don_age + race_mismatch + ischemia"
+
+
+#three status, region & LVAD
+region_lvad <- "Surv(t_1, t_2, dead) ~ tx*(stat_2 + stat_1b + factor(REGION) + cf_lvad) + tx_risky_don + era_tx"
+```
+
+
+
+```{r run_fe_cox_models_sens, include = FALSE}
+formulas_alt <- c(better_donor_year,better_donor_year_candidate, region_lvad)
+
+fe_models_alt <- vector(mode = "list", length(formulas_alt))
+
+for (i in seq_along(formulas_alt)) {
+  coxph_fe<- coxph(as.formula(formulas_alt[[i]]), to_model)
+  print(formulas_alt[[i]])
+  print(coxph_fe)
+  fe_models_alt[[i]] <- coxph_fe
+}
+```
+
+
+```{r fit_me_model_sens}
+me_models_alt <-  vector(mode = "list", length(formulas_alt))
+
+for (i in seq_along(formulas_alt)) {
+  f_coxme <- as.formula(paste(formulas_alt[[i]], " + (1+ tx|center)"))
+  start_time <- Sys.time()
+  fit <- coxme(f_coxme, data = to_model)
+  me_models_alt[[i]] <- fit
+  end_time <- Sys.time()
+  diff_time <- end_time - start_time
+  print(f_coxme)
+  print(diff_time)
+}
+
+save.image("end_results_with_alts.RData")
+```
+
+
+
+## Expanded donor factors
+```{r eTable8}
+print(me_models_alt[[1]])
+
+write_csv(table_fe_results(me_models_alt[[1]]), "expanded_donor_time.csv")
+
+three_stat_don_year <- variance_survival_benefit(me_models_alt[[1]])
+```
+The variance of the survival benefit of transplant was `r comma(three_stat_don_year)` on log hazard ratio scale, `r comma_2(100*(three_status_var-three_stat_don_year)/three_status_var)`% lower than the three-status model.
+
+
+## Expanded donor factors and candidate variables
+```{r etable_9}
+
+print(me_models_alt[[2]], digits = 2)
+
+
+write_csv(table_fe_results(me_models_alt[[2]]), "expanded_donor_time_can_factors.csv")
+
+three_stat_don_year_can <- variance_survival_benefit(me_models_alt[[2]])
+```
+The variance of the survival benefit of transplant was `r comma(three_stat_don_year_can)` on log hazard ratio scale, `r comma_2(100*(three_status_var-three_stat_don_year_can)/three_status_var)`% lower than the three-status model.
+
+## BTT LVAD and UNOS Region
+```{r}
+print(me_models_alt[[3]])
+
+write_csv(table_fe_results(me_models_alt[[3]]), "btt_lvad_and_region.csv")
+
+btt_lvad_region <- variance_survival_benefit(me_models_alt[[3]])
+```
+The variance of the survival benefit of transplant in the model including UNOS region and LVAD was `r comma(btt_lvad_region)` on log hazard ratio scale, `r comma_2(100*(three_status_var-btt_lvad_region)/three_status_var)`% lower than the three-status model.
+
+

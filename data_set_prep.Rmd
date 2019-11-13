@@ -1,0 +1,1134 @@
+---
+title: Data preparation for "Association of transplant center with survival benefit among adults undergoing heart transplantation in the United States"
+author: William F. Parker MD, MS, Allen S. Anderson MD, Robert D. Gibbons PhD, Edward
+  R Garrity Jr MD, Lainie F Ross, Elbert S. Huang MD, and Matthew M. Churpek MD, PhD
+date: 10/1/2019
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: '2'
+  html_notebook:
+    theme: journal
+    toc: yes
+    toc_depth: 2
+    toc_float: yes
+---
+
+```{r global_options, include = FALSE}
+library(knitr)
+
+#set global options for this rmarkdown document
+opts_chunk$set(cache = TRUE, warning=FALSE, message=FALSE, tidy.opts=list(width.cutoff=60))
+```
+
+\pagebreak
+
+# Introduction
+```{r packages, warning=FALSE, message=FALSE, cache = FALSE}
+#packages used
+library(haven)
+library(tidyverse)
+library(zoo)
+```
+
+
+```{r functions}
+#Convenience functions 
+numextract <- function(string){ 
+  as.numeric(str_extract(string, "\\-*\\d+\\.*\\d*"))
+} 
+
+comma <- function(x) format(x, digits = 3, big.mark = ",")
+
+comma_2 <- function(x) format(x, digits = 2, big.mark = ",")
+```
+
+
+This script creates a long form longitudinal dataset which tracks heart transplant candidates (identified by the **PX_ID** variable) from the time of initial listing until death. It requires the following SRTR Standard Analysis Files (SAF) data files as inputs (SAS format)
+
+1. "cand_thor.sas7bdat": Initial candidate registration data
+2. "stathist_thor.sas7bdat": Candidate status history record
+3. "statjust_hr1a.sas7bdat" and "statjust_hr1b.sas7bdat": Status 1A and 1B justification forms
+4. "tx_hr.sas7bdat": Transplant Record
+5. "donor_deceased.sas7bdat": Detailed data on deceased donors
+
+
+The script also creates the first paragraph of the results section as well as all the numbers for Figure 1.
+
+Our project used the quarter 3 2018 SAF:
+```{r read_in_SAS}
+
+# read in the SRTR SAF files
+cand_thor <- read_sas("SAF 2018 Q3/cand_thor.sas7bdat", NULL) %>%  
+  zap_formats() %>% zap_labels()
+
+tx_hr <- read_sas("SAF 2018 Q3/tx_hr.sas7bdat", NULL) %>%  
+  zap_formats() %>% zap_labels()
+
+stathist_thor <- read_sas("SAF 2018 Q3/stathist_thor.sas7bdat", NULL) %>%  
+  zap_formats() %>% zap_labels()
+
+statjust_hr1a <- read_sas("SAF 2018 Q3/statjust_hr1a.sas7bdat", NULL) %>%  
+  zap_formats() %>% zap_labels()
+
+statjust_hr1b <- read_sas("SAF 2018 Q3/statjust_hr1b.sas7bdat", NULL) %>% 
+  zap_formats() %>% zap_labels()
+
+donor_deceased <- read_sas("SAF 2018 Q3/donor_deceased.sas7bdat", NULL) %>%  
+  zap_formats() %>% zap_labels()
+
+
+institution <- read_sas("SAF 2018 Q3/institution.sas7bdat", NULL) %>%  
+  zap_formats() %>% zap_labels()
+```
+
+\pagebreak
+
+# Filter initial candidate listings according to inclusion/exclusion criterias
+
+Set data range and exclusion criteria
+```{r assign_data_range}
+start_year <- 2006
+end_year <- 2015
+min_tx <- 11 #minimum transplants in entire study period
+multi <- FALSE #exclude multi-organ recipients
+peds <- FALSE # exclude candidates < 18 at the time of listing
+
+outfile <- paste0("clean_time_series_revise", start_year, "_", end_year, ".csv")
+```
+
+Filter candidate dataset
+```{r date_range_select, echo = TRUE, message=FALSE, warning = FALSE}
+
+init_list <- cand_thor %>% 
+  mutate(list_date = CAN_LISTING_DT, dead_date = PERS_OPTN_DEATH_DT, rem_dt = CAN_REM_DT) %>% 
+  mutate(list_year = format(list_date, "%Y")) %>%
+	filter(list_year>=start_year & list_year <=end_year & WL_ORG == "HR")  %>% 
+  mutate(status = CAN_INIT_STAT, 
+         OPO = CAN_LISTING_OPO_ID,
+         date_start = list_date)
+
+#remove peds
+if (peds == FALSE){
+	init_list <- init_list %>% filter(CAN_AGE_AT_LISTING >17)	
+	tot_adults <- nrow(init_list)
+}
+
+#remove multiorgan recipients
+if (multi == FALSE){
+
+	multi_recips <- tx_hr %>% filter(REC_TX_TY == 2 | REC_TX_TY ==4) %>% select(PX_ID,REC_TX_TY)
+  
+	n_mults <- nrow(init_list %>% filter(PX_ID %in% multi_recips$PX_ID))
+	
+	init_list <- init_list %>% filter(!PX_ID %in% multi_recips$PX_ID)
+
+	remove(multi_recips)
+}
+
+#remove candidates listed at low volume centers
+init_list <- init_list %>% 
+  mutate(transplant = ifelse(CAN_REM_CD == 4, 1, 0)) %>%
+	group_by(CAN_LISTING_CTR_ID) %>% 
+  mutate(tot_tx = sum(transplant, na.rm = TRUE)) %>% ungroup() 
+
+
+num_all_centers <- length(unique(init_list$CAN_LISTING_CTR_ID))
+
+removed_low_tx <- nrow(init_list %>% filter(tot_tx< min_tx))
+
+init_list <- init_list %>% filter(tot_tx>=min_tx) 
+
+#number of low volume centers
+num_low_vol_centers <- num_all_centers - length(unique(init_list$CAN_LISTING_CTR_ID))
+```
+
+
+
+Identify last observation date for each candidate
+```{r death_date_consolidation, warning=FALSE, message=FALSE}
+#link to transplant record and 
+#identify identify last observation date (death, re-transplant, or last follow-up)
+init_list <- 
+  init_list %>% left_join(tx_hr %>% select(PX_ID, TFL_LASTATUS, TFL_DEATH_DT, TFL_LAFUDATE), 
+                          by = "PX_ID") %>% 
+  mutate(
+    to_die = case_when(
+      CAN_REM_CD %in% c(8, 21)==TRUE ~ 1 ,
+      TFL_LASTATUS %in% c("D", "R") ==TRUE ~1,
+      is.na(PERS_OPTN_DEATH_DT) == FALSE ~ 1,
+      is.na(PERS_SSA_DEATH_DT) == FALSE ~ 1,
+      TRUE ~0
+  ),
+  tfl_date = TFL_LAFUDATE,
+  dead_date = case_when(
+      is.na(PERS_OPTN_DEATH_DT) == FALSE ~ PERS_OPTN_DEATH_DT,
+      TRUE ~ PERS_SSA_DEATH_DT),
+  rem_dt = CAN_REM_DT,
+  final_dt = case_when(
+    is.na(dead_date) == FALSE ~ dead_date,
+    is.na(tfl_date) == FALSE ~ tfl_date,
+    TRUE ~ rem_dt)
+)
+
+#preview data
+init_list %>% 
+  select(PX_ID, to_die, list_date, final_dt, CAN_REM_CD, 
+         rem_dt, REC_TX_DT, TFL_LASTATUS, tfl_date, 
+         PERS_OPTN_DEATH_DT, PERS_SSA_DEATH_DT, dead_date) %>% 
+  arrange(list_date)
+```
+
+\pagebreak
+
+# Select Candidate Covariates
+
+Candidate covariates required to assign initial listing status under the three-status system and the six-status system.
+Additional covariates for revision include Age, gender, BMI, Blood type, Cardiac Diagnosis, and sensitization
+```{r select_key_init_vars, echo = TRUE }
+init_list <- init_list %>% 
+  select(PX_ID, OPO, CAN_LISTING_CTR_ID, status, 
+         date_start, list_year, list_date, dead_date, final_dt, to_die,
+         CAN_DGN,
+         CAN_REM_CD, PERS_OPTN_DEATH_DT, PERS_SSA_DEATH_DT,
+         CAN_INIT_STAT,
+         CAN_VAD_TY, CAN_VAD1, CAN_VAD2, CAN_IV_INOTROP,
+         CAN_IABP, CAN_ECMO, CAN_TAH,
+         CAN_CARDIAC_OUTPUT, CAN_CARDIAC_OUTPUT_MEDS, 
+         CAN_HGT_CM, CAN_WGT_KG,
+         CAN_PCW_MEAN, CAN_PCW_MEAN_MEDS,
+         CAN_AGE_AT_LISTING, CAN_GENDER, CAN_BMI, CAN_ABO, CAN_DGN, 
+         CAN_PRELIM_XMATCH_REQUEST
+	) %>%
+  mutate(age = CAN_AGE_AT_LISTING,
+         female = ifelse(CAN_GENDER == "F", 1, 0),
+         bmi_low = case_when(
+           CAN_BMI < quantile(init_list$CAN_BMI, probs = c(0.25, 0.75), na.rm = TRUE)[[1]] ~ 1,
+           is.na(CAN_BMI) == FALSE ~ 0
+         ),
+         bmi_high = case_when(
+           CAN_BMI > quantile(init_list$CAN_BMI, probs = c(0.25, 0.75), na.rm = TRUE)[[2]] ~ 1,
+           is.na(CAN_BMI) == FALSE ~ 0
+         ),
+         blood_type = factor(
+           case_when(
+             CAN_ABO %in% c("A", "A1", "A2") ~ "A",
+             CAN_ABO %in% c("A1B", "A2B") ~ "AB",
+             TRUE ~ CAN_ABO)
+           ),
+        simple_diag = case_when(
+          CAN_DGN>999 & CAN_DGN<1007 ~ "Dilated cardiomyopathy, non-ischemic",
+          CAN_DGN == 1007 | CAN_DGN ==1200 ~ "Ischemic cardiomyopathy",
+          CAN_DGN>1048 & CAN_DGN< 1100 ~ "Restrictive cardiomyopathy",
+          TRUE ~ "Other"
+        ),
+        simple_diag = factor(simple_diag, 
+                           levels = c("Dilated cardiomyopathy, non-ischemic", 
+                                      "Ischemic cardiomyopathy", 
+                                      "Restrictive cardiomyopathy", 
+                                      "Other")),
+        cross_match = ifelse(CAN_PRELIM_XMATCH_REQUEST == "Y", 1, 0)
+  )
+
+table(init_list$blood_type)
+remove(cand_thor)
+```
+
+
+#Select Transplant Recipient and Donor Covariates
+Keep transplant and Donor variables used in donor risk index score
+* Donor Age
+* Donor BUN/Cr
+* Ischemic time
+* Race Mismatch
+
+And other recipient covariates to generate table S4 in the supplement (comparison of recipient characteristics at high and low benefit centers)
+
+1. Renal function
+2. Cardiac diagnosis
+3. History of Cardiac Surgery
+4. Age
+5. Listing Status
+6. Support (MCS)
+7. ICD
+8. BMI
+9. Functional Status
+10. Gender
+11. Race
+15. Hemodynamics (Cardiac index and Pulmonary Wedge pressure)
+
+
+```{r select_tx_donor }
+tx <- tx_hr %>% filter(PX_ID %in% init_list$PX_ID) %>%
+	mutate(tx_date= REC_TX_DT,
+	       tfl_date = TFL_LAFUDATE,
+	       status = CAN_LAST_STAT) %>% 
+	arrange(PX_ID, tx_date)
+
+tx <- tx %>% select(PX_ID, REC_OPO_ID, REC_CTR_ID, DONOR_ID, status, tx_date, CAN_RACE,
+	CAN_DIAB_TY, CAN_DIAB,
+	REC_CREAT, REC_DIAL,
+	REC_DGN, 
+	REC_CARDIAC_SURG, 
+	REC_VAD_TY, REC_VAD1, REC_VAD2, REC_INOTROP, 
+	REC_IABP, REC_ECMO, 
+	REC_IMPLANT_DEFIB, 
+	REC_BMI,
+	REC_FUNCTN_STAT, 
+	REC_CARDIAC_OUTPUT, REC_CARDIAC_OUTPUT_MEDS, REC_HGT_CM, REC_WGT_KG,
+	REC_PCW_MEAN, REC_PCW_MEAN_MEDS,
+	REC_PULM_ART_MEAN, REC_PULM_ART_MEAN_MEDS,
+	REC_HR_ISCH,
+	TFL_LASTATUS, TFL_LAFUDATE
+)
+
+
+donos <- donor_deceased %>% filter(DONOR_ID %in% tx$DONOR_ID) %>% 
+  mutate(DON_BUN = as.integer(DON_BUN), 
+         DON_CREAT = as.integer(DON_CREAT))
+
+donos <- donos %>% select(DONOR_ID, DON_OPO_CTR_ID,
+  DON_AGE,
+	DON_RACE,
+	DON_CREAT, DON_BUN
+	)
+
+tx <- left_join(tx, donos, by = "DONOR_ID")
+
+tx <- tx %>% mutate(
+	white_recip = ifelse(CAN_RACE == 8,1,0),
+	white_donor = ifelse(DON_RACE == 8,1,0),
+	simple_race = case_when(
+		CAN_RACE == 8 ~ "White", 
+		CAN_RACE == 16 ~ "Black", 
+		CAN_RACE == 2000 ~ "Hispanic", 
+		CAN_RACE == 64 ~ "Asian", 
+		TRUE ~ "Other"),
+	simple_don_race = case_when(
+		DON_RACE == 8 ~ "White", 
+		DON_RACE == 16 ~ "Black", 
+		DON_RACE == 2000 ~ "Hispanic", 
+		DON_RACE == 64 ~ "Asian", 
+		TRUE ~ "Other"),
+	black = ifelse(simple_race == "Black", 1, 0),
+	black_don = ifelse(simple_don_race == "Black", 1, 0),
+	drs = case_when(
+			REC_HR_ISCH/60 < 2 ~ 1,
+			REC_HR_ISCH/60 >= 2 & REC_HR_ISCH/60 < 4 ~ 2,
+			REC_HR_ISCH/60 >=4 & REC_HR_ISCH/60 < 6 ~ 3,
+			REC_HR_ISCH/60 >= 6 & REC_HR_ISCH/60 < 8 ~4,
+			TRUE ~ 5
+		)+
+		case_when(
+			DON_AGE >=40 & DON_AGE <50 ~ 3,
+			DON_AGE >= 50 ~ 5,
+			TRUE ~ 0
+		) +
+		case_when(
+			(DON_BUN/DON_CREAT) > 30 ~ 3,
+			TRUE ~ 0
+		) +
+		case_when(
+			black != black_don ~ 2,
+			TRUE ~ 0
+		)
+	)
+
+#identify "overtreated" recipients based on recipient hemodynamics. 
+tx <- tx %>% mutate(
+	bsa = 0.007184*(REC_HGT_CM)^(0.725)*REC_WGT_KG^(0.425),
+	recip_pcwp = as.numeric(REC_PCW_MEAN),
+	recip_ci = REC_CARDIAC_OUTPUT/bsa,
+ 	iabp_rec_no_shock = case_when(
+ 		recip_pcwp < 15 & REC_IABP ==1 ~ 1,
+    	recip_ci > 1.8 & REC_CARDIAC_OUTPUT_MEDS == "N" & REC_IABP ==1 ~ 1,
+    	recip_ci > 2.0 & REC_IABP ==1 ~ 1
+  		),
+	recip_overtreat = case_when(
+		recip_pcwp < 15 & REC_INOTROP ==1 & REC_VAD_TY == 1 ~ 1,
+    	recip_ci > 1.8 & REC_CARDIAC_OUTPUT_MEDS == "N" & REC_INOTROP ==1 & REC_VAD_TY == 1 ~ 1,
+    	recip_ci > 2.2 & REC_INOTROP ==1 & REC_VAD_TY == 1~ 1,
+		recip_pcwp < 15 & REC_IABP ==1 & REC_VAD_TY == 1 ~ 1,
+    	recip_ci > 1.8 & REC_CARDIAC_OUTPUT_MEDS == "N" & REC_IABP ==1 & REC_VAD_TY == 1~ 1,
+    	recip_ci > 2.0 & REC_IABP ==1 & REC_VAD_TY == 1~ 1
+	)
+)
+
+
+#remove the race variable to avoid redundancy
+tx <- tx %>% select(-CAN_RACE)
+
+
+remove(tx_hr, donor_deceased, donos)
+
+#preview transplant recipient dataset
+tx
+```
+
+
+\pagebreak
+
+# Merge data sets to create time series
+Filter status history file and select key variables
+
+* Status 1A = 2010
+* Status 1B = 2020
+* Status 2 = 2030
+* Inactive = 2999
+```{r select_historys, echo = TRUE }
+hist <- stathist_thor %>% filter(PX_ID %in% init_list$PX_ID) %>% 
+	mutate(date_start = CANHX_BEGIN_DT, 
+	       date_end = CANHX_END_DT, 
+	       status = CANHX_STAT_CD, 
+	       real_status = CANHX_STAT_CD, 
+	       rem_dt = CAN_REM_DT) %>% 
+	arrange(PX_ID, date_start) %>% 
+  select(PX_ID, status, real_status, date_start, date_end, rem_dt,  CAN_REM_CD)
+
+hist <- distinct(hist, PX_ID, date_start, .keep_all = TRUE)
+
+remove(stathist_thor)
+
+#preview status history data set
+hist
+```
+
+Filter status 1A justification file and select key variables
+```{r select_just_1a}
+just_1a <- statjust_hr1a %>% 
+  filter(PX_ID %in% init_list$PX_ID)  %>% 
+	mutate(date_start = CANHX_CHG_DT, 
+		status = CANHX_STAT_CD) %>% 
+	arrange(PX_ID, date_start) 
+
+#remove redundant or erroneous justifications
+just_1a <- distinct(just_1a) %>% 
+  filter(CANHX_FORM_STAT == 4 | CANHX_FORM_STAT == 8) %>% 
+  distinct(PX_ID, date_start, .keep_all = TRUE)
+
+
+#select key variables
+just_1a <- just_1a %>% select(PX_ID, CAN_LISTING_CTR_ID, 
+  status, date_start, CANHX_STAT_TY, CANHX_FORM_STAT, 
+	CANHX_DIALYSIS, CANHX_LAB_SERUM_CREAT, 
+	CANHX_ADULT_CRITERIA_A, CANHX_ADULT_CRITERIA_B, 
+  CANHX_ADULT_CRITERIA_C, CANHX_ADULT_CRITERIA_D, 
+  CANHX_ADULT_CRITERIA_E, CANHX_INTRP_DOBU, CANHX_INTRP_DOPA, CANHX_INTRP_MILRIN,
+	CANHX_ADMITTED, 
+	CANHX_IABP, CANHX_ECMO, CANHX_LVAD_TYPE, CANHX_VAD, CANHX_TAH, CANHX_RVAD_TYPE,
+	CANHX_LAB_BILI, 
+	CANHX_CARD_OUTPUT, CANHX_HEMO_CI, CANHX_HEMO_INTRP_OBTAINED, CANHX_HEMO_BSA,
+	CANHX_HEMO_PCWP,
+	CANHX_HEMO_MPAP,
+	CANHX_DEV_MALFUNCTN,
+	CANHX_DEV_VENT_ARRYTHM
+	)
+
+remove(statjust_hr1a)
+
+just_1a
+```
+
+
+Filter status 1B justifcation file and select key variables. These forms have a lot less information, mainly just report VAD vs. inotropes
+```{r select_1b}
+just_1b <- statjust_hr1b %>% filter(PX_ID %in% init_list$PX_ID) %>% 
+	mutate(date_start = CANHX_CHG_DT, 
+		status = CANHX_STAT_CD, 
+		stable_lvad = CANHX_VAD, 
+		except_1b =CANHX_CRIT_NOT_MET,
+		low_dose_ino = pmax(CANHX_REQUIRE_LOW_INOTROP, CANHX_CONT_IV_INOTROP)
+		) %>% 
+	arrange(PX_ID, date_start)
+
+
+just_1b <- distinct(just_1b) %>% 
+  filter(CANHX_FORM_STAT == 4 | CANHX_FORM_STAT == 8) %>%	
+  distinct(PX_ID, date_start, .keep_all = TRUE)
+
+just_1b <- just_1b %>% 
+  select(PX_ID, CAN_LISTING_CTR_ID, status, date_start, 
+	low_dose_ino, stable_lvad, except_1b
+	)
+
+remove(statjust_hr1b) 
+
+just_1b
+```
+
+
+Merge data sets to create time series
+```{r create_cand_time_series, message = FALSE, warning = FALSE }
+#merge with history 
+cand_time_series <- init_list %>% 
+  mutate(int_form =1, rem_cd = CAN_REM_CD) %>% 
+  full_join(hist, c("PX_ID", "date_start", "status"), suffix = c(".init", ".hist")) %>% 
+  arrange(PX_ID, date_start)
+
+
+#merge with 1A justifications, keeping justification forms in the middle of a history period
+cand_time_series <- cand_time_series %>% 
+  full_join(just_1a, by = c("PX_ID", "date_start", "status"), suffix = c(".init", ".j1a"))  %>% 
+  arrange(PX_ID, date_start)
+
+#merge with 1B justiciations, keeping justification forms in the middle of a history period
+cand_time_series <- cand_time_series %>% 
+  full_join(just_1b, by = c("PX_ID", "date_start", "status"), suffix = c(".init", ".j1b")) %>% 
+  arrange(PX_ID, date_start) 
+
+#carryforward "real status" status history dataset
+cand_time_series <- cand_time_series %>% arrange(PX_ID, date_start) %>% 
+  group_by(PX_ID) %>% 
+  mutate(real_status = na.locf(real_status, na.rm = FALSE)) %>% 
+  ungroup() 
+
+#remove justification forms that didn't actually change offical status
+cand_time_series <- cand_time_series %>% 
+  filter(real_status == status | int_form ==1)
+
+
+
+```
+
+
+Add transplant files to time series
+```{r add_tx,  message = FALSE, warning = FALSE}
+
+cand_time_series <- cand_time_series %>% 
+  mutate(date = date_start)
+
+tx <- tx %>% mutate(date = tx_date)
+
+time_series <- cand_time_series %>% 
+  full_join(tx, by = c("PX_ID", "date", "status"), suffix = c(".cand", ".tx")) %>% 
+  arrange(PX_ID, date) 
+
+
+#verify initial status counts are the same (not run)
+# init_list %>% count(status)
+# cand_time_series %>% filter(int_form==1) %>% count(status)
+#time_series %>% filter(int_form==1) %>% count()
+```
+There are a total of `r nrow(time_series)` observations in the dataset for `r length(unique(time_series$PX_ID))` candidates listed during the study period. The post-transplant period is considered one observation.
+
+Convert dates to start/stop time in days variables
+```{r last_ob, echo = TRUE }
+
+#carryforward key dates and death status
+ts <- time_series %>% ungroup() %>% 
+  arrange(PX_ID, date) %>% 
+  group_by(PX_ID) %>% 
+  mutate(
+    tx = if_else(is.na(tx_date)==FALSE, 1, 0), 
+  	to_die = na.locf(to_die, na.rm = FALSE),
+    final_dt = na.locf(final_dt, na.rm = FALSE),
+    list_date = na.locf(list_date, na.rm = FALSE)
+)
+
+
+#create time (days) variable
+ts <- ts %>% group_by(PX_ID) %>% mutate(
+  t_1 = as.numeric(date-list_date),
+	last_ob = if_else(row_number()==n(), 1, 0),
+  t_2 = ifelse(last_ob ==0, lead(t_1), final_dt - list_date)
+) %>% ungroup()
+
+
+# capture transplant procedure deaths
+# This captures hyperacute perioperative risk. Also capture one day listings of any type
+ts <- ts %>% 
+  mutate( t_2 = ifelse(t_1 == t_2 & tx ==1 & date == final_dt & to_die ==1, t_2 + 1, t_2),
+          t_2 = ifelse(t_1 == t_2 & list_date == final_dt & int_form ==1, t_2 + 1, t_2))
+
+#filter out one day periods and erroneous datings 
+#(where listing date is after the death date in social security death master file). 
+#This erroneous listings are including as in the exclusions in Figure 1)
+ts <- ts %>%
+  filter(t_2 > t_1) %>% 
+  group_by(PX_ID) %>%
+  mutate(
+    last_ob = if_else(row_number()==n(), 1, 0),
+    dead = if_else(last_ob ==1 & to_die ==1, 1, 0)
+  ) %>% 
+  ungroup()
+
+#preview clean time series data
+ts %>% select(PX_ID, status,tx, t_1, t_2, dead, date, list_date, final_dt)
+
+#137 date entry errors below
+#ts %>% filter(int_form==1) %>% count()
+```
+
+
+```{r center_OPO}
+#create center and OPO variables
+ts <- ts %>% mutate(
+  center = case_when(
+  	is.na(CAN_LISTING_CTR_ID.init) == FALSE ~ CAN_LISTING_CTR_ID.init,
+  	is.na(CAN_LISTING_CTR_ID.j1a) == FALSE ~ CAN_LISTING_CTR_ID.j1a,
+  	is.na(REC_CTR_ID) == FALSE ~ REC_CTR_ID
+	), 
+  center = na.locf(center))
+
+ts <- ts %>% mutate(
+  OPO = case_when(
+	is.na(REC_OPO_ID) == FALSE ~ REC_OPO_ID,
+	TRUE ~ OPO
+	),  OPO = na.locf(OPO))
+
+
+ts %>% select(PX_ID, center, OPO, status, t_1, t_2, tx, dead)
+```
+
+\pagebreak
+
+# Code six-status designations
+
+Generate 
+* `stat_just`, a variable to that identifies three-status justifications and inactive statuses
+* `three_status`, a variable that is missing when inactive and just records active three-status
+* `era_tx` (transplant year dichotomized)
+* `tx_risky_don` (donor risk score > 5) transplant modifying variables
+```{r define_key_vars}
+final <- ts %>% 
+  mutate(
+  stat_just = case_when(
+    CANHX_ADULT_CRITERIA_A ==1~ "Status 1A (MCS for shock)",
+    CANHX_ADULT_CRITERIA_B == 1 ~ "Status 1A (MCS complication)",
+    CANHX_ADULT_CRITERIA_C == 1 ~ "Status 1A (Mechanical ventilation)",
+    CANHX_ADULT_CRITERIA_D == 1 ~ "Status 1A (High dose inotropes)",
+    CANHX_ADULT_CRITERIA_E == 1 ~ "Status 1A (Exception)",
+    status == 2010 & tx == 0 ~ "Status 1A (no justification listed)",
+    status == 2010 & tx == 1 & t_1 == 0 ~ "Status 1A (no justification listed)",
+    status == 2020 & low_dose_ino ==1  ~ "Status 1B (inotropes)",
+    status == 2020 & stable_lvad ==1 ~ "Status 1B (stable VAD)",
+    status == 2020 & except_1b ==1 ~ "Status 1B (Exception)",
+    status == 2020 & tx == 0 ~ "Status 1B (No justification listed)",
+    status == 2030  ~ "Status 2",
+    status == 2999 ~ "Inactive"),
+  tx_year = as.numeric(format(tx_date, "%Y")),
+  era_tx = ifelse((tx_year<=2010) & tx ==1, 1, 0),
+  tx_risky_don = if_else(tx ==1 & drs>5, 1, 0),
+  three_status = case_when(
+    status == 2010 ~ "Status 1A",
+    status == 2020 ~ "Status 1B",
+    status == 2030 ~ "Status 2"
+  )
+  )
+```
+
+
+Identify LVAD complications that are not device malfunctions
+```{r lvad_comp}
+final <- final %>% mutate(
+  lvad_comp = case_when(
+    CANHX_ADULT_CRITERIA_B ==1 & CANHX_DEV_MALFUNCTN ==1 ~ as.numeric(0),
+    TRUE ~ as.numeric(CANHX_ADULT_CRITERIA_B)
+  )
+)
+```
+
+Identify LVAD patients listed with Status 1A elective time
+```{r elective_1A, echo = TRUE }
+##official SRTR list 
+durable_list <- c(205, 206, 208, 210, 216, 217, 223, 224, 230, 231, 232, 233, 
+                  305, 306, 313, 316, 319, 325, 402)
+lvad_list <- c(205, 206, 208, 210, 216, 217, 223, 224, 230, 231, 232, 233)
+final <- final %>%mutate(
+  cf_lvad = case_when(
+    CANHX_LVAD_TYPE %in% lvad_list ~1,
+    CAN_VAD_TY == 2 & CAN_VAD1 %in% lvad_list ~ 1,
+    REC_VAD_TY == 2 & REC_VAD1 %in% lvad_list ~ 1,
+    CANHX_ADULT_CRITERIA_B==1 ~1,
+    status == 2020 & stable_lvad==1 ~ 1
+  ),
+    elective_1A = case_when(
+    CANHX_ADULT_CRITERIA_A ==1 & cf_lvad ==1 & CANHX_IABP ==0 & CANHX_ECMO ==0 ~ 1,
+    CANHX_ADULT_CRITERIA_B == 1 ~ 0,
+    CANHX_ADULT_CRITERIA_C == 1 ~ 0,
+    CANHX_ADULT_CRITERIA_D == 1 ~ 0,
+    CANHX_ADULT_CRITERIA_E == 1 ~ 0
+    )
+) 
+```
+
+Identify time periods when candidate supported with an IABP or multiple inotropes would be downgraded to Status 4 based on cardiac index, pulmonary capillary wedge pressure, or inotrope dose. See supplement for more details
+```{r add_over_treat, message= FALSE, warning = FALSE}
+final <- final %>% mutate(
+  ino_ci = as.numeric(CANHX_HEMO_CI),
+	ino_pcwp = as.numeric(CANHX_HEMO_PCWP),
+  n_inos = ifelse(is.na(CANHX_INTRP_DOPA)==FALSE, 1, 0) + 
+    ifelse(is.na(CANHX_INTRP_DOBU)==FALSE, 1, 0) + 
+    ifelse(is.na(CANHX_INTRP_MILRIN)==FALSE, 1, 0),
+  n_inos = ifelse(status != 2010, NA, n_inos),
+	multi_ino = ifelse(n_inos > 1, 1, 0),
+	single_ino = ifelse(n_inos ==1, 1, 0),
+	low_d_ino = ifelse(n_inos> 1 & 
+	           (CANHX_INTRP_DOPA<3 | CANHX_INTRP_MILRIN <0.25 | CANHX_INTRP_DOBU < 3), 1, 0),
+	low_s_ino = ifelse(n_inos ==1 & (CANHX_INTRP_MILRIN <0.5 | CANHX_INTRP_DOBU < 7.5),1,0),
+  bsa = 0.007184*(CAN_HGT_CM)^(0.725)*CAN_WGT_KG^(0.425),
+  tcr_ci = CAN_CARDIAC_OUTPUT/bsa,
+  iabp_no_shock = case_when(
+    tcr_ci > 1.8 & CAN_CARDIAC_OUTPUT_MEDS == "N" & (CANHX_IABP==1 | CAN_IABP ==1) ~ 1,
+    tcr_ci > 2.0 & (CANHX_IABP==1 | CAN_IABP ==1) ~ 1,
+    is.na(tcr_ci) == FALSE & (CANHX_IABP==1 | CAN_IABP ==1) ~ 0
+  ),
+	overtreat = case_when(
+	  iabp_rec_no_shock ==1 ~ 1,
+		recip_overtreat == 1 ~ 1,
+		CAN_PCW_MEAN < 15 & CAN_IABP ==1 ~ 1,
+		CANHX_HEMO_PCWP < 15 & CANHX_ADULT_CRITERIA_D ==1 ~ 1,
+		ino_ci>2.2~ 1,
+		ino_pcwp <15 ~ 1,
+		(ino_ci>1.8 & CANHX_HEMO_INTRP_OBTAINED =="N") ~ 1,
+		low_d_ino == 1 | low_s_ino == 1 ~ 1, 
+		iabp_no_shock == 1 ~ 1,
+		ino_ci <= 1.8 ~ 0,
+		(ino_ci <= 2.2 & CANHX_HEMO_INTRP_OBTAINED =="Y") ~ 0,
+		iabp_no_shock == 0 ~ 0
+	),
+  over_1a = ifelse(status == 2020 | status == 2030, 0, overtreat)
+)
+
+```
+
+Code six-status 
+```{r code_six_status}
+#non dischargable VADs
+non_discharge <- c(201, 203, 204, 209, 215, 218, 221, 222, 225, 226, 227, 228, 
+                   234, 301, 302, 303, 309, 310, 311, 320, 321)
+
+#restrictive, amyloid, CHD, and HCOM, cardiomyopathy diagnoses
+stat4_diagnoses <- c(1050, 1051, 1052, 1053, 1054, 1099, 1100, 1101, 1102, 
+                     1103, 1104, 1105, 1106, 1199, 1200, 1201, 1203, 1205, 1206, 1207, 1208)
+
+
+final <- final %>% group_by(PX_ID) %>% 
+  mutate(diagnosis = na.locf(CAN_DGN, na.rm = FALSE)) %>%
+  ungroup()
+
+
+final <- final %>% mutate(
+  six_status = case_when(
+    status == 2020~ 4,
+    diagnosis %in% stat4_diagnoses & status ==2030 ~ 4,
+    status == 2030~ 6,
+    overtreat == 1 ~ 4,
+    elective_1A ==1 ~ 3,
+    lvad_comp ==1 ~3,
+    CAN_ECMO == 1 ~1,
+    CANHX_ECMO == 1 ~ 1,
+    REC_ECMO == 1 ~ 1,
+    CANHX_ADULT_CRITERIA_A ==1 & CANHX_RVAD_TYPE %in% non_discharge ~ 1,
+    CAN_VAD_TY == 5 & (CAN_VAD1 %in% non_discharge | CAN_VAD2 %in% non_discharge) ~ 1,
+    REC_VAD_TY == 5 & (REC_VAD1 %in% non_discharge | REC_VAD2 %in% non_discharge) ~ 1,
+    CANHX_ADULT_CRITERIA_A ==1 ~ 2,
+    CANHX_DEV_MALFUNCTN ==1  ~ 2,
+    CANHX_DEV_VENT_ARRYTHM == 1 ~ 2,
+    status == 2010 & tx ==0 ~ 3
+  ),
+  over_1a = ifelse(six_status != 4, 0, over_1a),
+  elective_1A = ifelse(six_status != 3 | status == 2999, 0, elective_1A),
+  lvad_comp = ifelse(six_status != 3, 0, lvad_comp)) 
+
+#confirm that the status 2010 patients reassigned to status 4 are all overtreated (not run)
+#final %>% filter(six_status ==4 & status ==2010) %>% count(over_1a)
+```
+
+
+Add LVAD variable
+```{r lvad_variable}
+final <- final %>%
+  mutate(lvad = case_when(
+    lvad_comp ==1 ~ 1,
+    elective_1A == 1 ~ 1,
+    stable_lvad == 1 ~ 1
+  ))
+```
+
+
+Example data for a patient:
+```{r example_patient}
+final %>% filter(PX_ID == 531687) %>% 
+  select(t_1, t_2, tx, dead, stat_just, six_status, 
+         over_1a, lvad_comp, elective_1A)
+```
+This patient went through the following status changes:
+
+* status 1B with IV inotropes (day 0-35)
+* status 1A exception (coded as six-status 3) (day 36-41)
+* status 1B with IV inotropes (day 42-140)
+* status 1A with high dose IV inotropes (remained six-status 4 due to lack of cardiogenic shock) (day 141-148)
+* Inactivated (day 150-177) 
+* re-activated at Status 1A s/p durable LVAD implantation with elective time (six-status 3) (day 178-181)
+* Inactivated (day 182-197)
+* re-activated at Status 1A w/ LVAD complication (not device failure, so six-status 3) (day 198-208)
+* transplanted and survived for over ten years (day 209- 3863)
+
+
+When the candidate is inactivated from the list, we carry forward their status from the previous observed period. Because many candidates are deactivated from list before dying, this assumption allows the model to appropriately capture the risk of each active waitlist status.
+```{r carry_forward}
+#carry forward statuses to fill inactive periods
+data <- final %>% 
+  arrange(PX_ID, t_1) %>% group_by(PX_ID) %>% 
+  mutate_at(vars(six_status, stat_just, three_status, 
+                 over_1a, list_year, 
+                 lvad_comp, elective_1A, cf_lvad, 
+                 blood_type, age, female, bmi_low, 
+                 bmi_high, simple_diag, cross_match), 
+            list(~na.locf(., na.rm = FALSE))) %>% 
+  ungroup()
+
+
+```
+
+Example data for a patient with statuses "carried forward"
+```{r example_with_filled_in_status}
+data %>% filter(PX_ID == 531687) %>% 
+  select(t_1, t_2, tx, dead, 
+         stat_just, six_status, over_1a, 
+         lvad_comp, elective_1A, cf_lvad, 
+         age, female, black, 
+         bmi_low, bmi_high, diagnosis, cross_match)
+```
+
+
+
+```{r}
+data %>% select(PX_ID, t_1, t_2, tx, dead, stat_just, cf_lvad)
+```
+
+
+For the `r data %>% filter(tx ==1 & t_1 ==1) %>% nrow()` recipients with only one observation, assign them status three for 1A, four for 1B, and six for 2.
+```{r tx_only}
+data <- data %>%
+  mutate(
+    six_status = case_when(
+      tx ==1 & is.na(six_status) & three_status == "Status 1A" ~ 3,
+      tx ==1 & is.na(six_status) & three_status == "Status 1B" ~ 4,
+      tx ==1 & is.na(six_status) & three_status == "Status 2" ~ 6,
+      TRUE ~ six_status
+    )
+  )
+```
+
+
+```{r dummy_code}
+#dummy code statuses
+data <- data %>%
+  mutate(
+    stat_1a = ifelse(three_status == "Status 1A", 1, 0),
+    stat_1b = ifelse(three_status =="Status 1B", 1,0),
+    stat_2 = ifelse(three_status == "Status 2", 1, 0), 
+    status_1 = ifelse(six_status == 1, 1, 0),
+    status_2 = ifelse(six_status == 2, 1, 0),
+    status_3 = ifelse(six_status == 3, 1, 0),
+    status_4 = ifelse(six_status == 4, 1, 0),
+    status_6 = ifelse(six_status == 6, 1, 0)
+  )
+```
+
+
+# Create analytic dataset for the model and write out as csv file
+```{r create_outfile}
+to_model <- data %>% 
+  select(PX_ID, center, OPO, t_1, t_2, tx, dead, stat_1a, stat_1b, stat_2, 
+         status_1, status_2, status_3, status_4, status_6, 
+         stat_just, three_status, six_status,
+         cf_lvad,
+         era_tx, tx_risky_don,
+         DON_BUN, DON_CREAT, DON_AGE, REC_HR_ISCH, 
+         black, black_don,
+         list_year,
+         age, female, blood_type, bmi_low, bmi_high, simple_diag, cross_match) %>%
+  mutate_at(vars(cf_lvad, black, black_don, REC_HR_ISCH, DON_BUN, DON_CREAT, DON_AGE), 
+            list(~ifelse(is.na(.)==TRUE, 0, .)))%>%
+  drop_na(stat_1a) ##Key filter step, removes patients who were never activated
+
+# not run- confirm dropped patients were never activated on the waitlist
+# data %>% 
+#   group_by(PX_ID) %>%
+#   count(stat_just) %>%
+#   mutate(total_justs = sum(n)) %>%
+#   spread(key = stat_just, value = n) %>%
+#   filter(total_justs == Inactive)
+```
+
+
+```{r center_region}
+center_region <- institution %>% 
+  filter(CTR_TY %in% c("TX1", "VA1", "FTX")) %>% 
+  select(CTR_ID, REGION) %>%
+  rename(center= CTR_ID)
+
+to_model <- to_model %>% left_join(center_region, by = "center")
+```
+
+```{r outfile, echo = TRUE}
+#write final data set out as a csv file
+write_csv(to_model, outfile)
+```
+
+
+## Six-status system coding summary for all observations
+```{r status_switch_table}
+ftable(to_model$stat_just, to_model$six_status)
+```
+Note: The candidates with exceptions, high dose inotropes, or mechanical ventilation who MCS complications who were coded as Status 1 met the criteria because had a MCSD with life-threatening ventricular arrhythmia, or were supported by VA ECMO or Non-dischargeable, surgically implanted, non-endovascular bi-ventricular support device.
+
+##Six-status system coding summary for all recipients
+```{r status_switch_table_recips_detail}
+recips <- to_model %>% filter(tx ==1)
+ftable(recips$stat_just, recips$six_status)
+```
+
+
+```{r status_switch_no_detail}
+ftable(recips$six_status, recips$three_status)
+
+to_model %>% select(PX_ID, t_1, t_2, tx, dead, stat_just, cf_lvad)
+```
+
+
+\pagebreak
+
+# Results: *Study Population*
+```{r simple_flow}
+
+
+#calculate values for flow-chart
+tot_analyzed <- to_model %>% group_by(PX_ID) %>% filter(row_number()==1) %>% ungroup() %>% nrow()
+
+miss_data <- nrow(init_list) - tot_analyzed
+
+#missing data exclusion detail
+total_exclusions <- tot_adults - tot_analyzed
+
+
+##identify candidates who were never active
+only_inactive <- data %>% 
+  group_by(PX_ID) %>% summarise(mean_stat = min(status)) %>% 
+  filter(mean_stat == 2999) %>% ungroup() %>% nrow()
+
+##remaining candidates had erroneous dates
+error_dates <- init_list %>% filter(!PX_ID %in% data$PX_ID)
+error_dates <- length(unique(error_dates$PX_ID))
+
+
+#outcomes
+
+##total deaths without transplant
+died_before_tx <- to_model %>% 
+  group_by(PX_ID) %>% 
+  filter(row_number()== n()) %>% 
+  ungroup() %>% 
+  filter(tx ==0 & dead ==1) %>% nrow()
+
+##deaths while still active on list
+death_on_list <- data %>% 
+  filter(PX_ID %in% to_model$PX_ID) %>% 
+  group_by(PX_ID) %>% 
+  filter(row_number()==1) %>% 
+  ungroup() %>% 
+  filter(CAN_REM_CD.init == 8) %>%
+  nrow()
+
+##deaths after delisting
+died_delist <- died_before_tx - death_on_list
+
+##transplanted
+tot_tx <- recips %>% nrow()
+
+##still waiting at end of follow-up
+still_waiting <-tot_analyzed - tot_tx - died_before_tx
+
+#Post-transplant outcomes
+##dead or re-transplanted post-transplant
+dead_post_tx <- recips %>% filter(dead ==1) %>% nrow()
+
+##re-transplant
+post_tx_re_tx <- data %>% 
+  filter(PX_ID %in% to_model$PX_ID) %>% 
+  group_by(PX_ID) %>% 
+  filter(tx == 1) %>% 
+  ungroup() %>% 
+  filter(TFL_LASTATUS == "R") %>%
+  nrow()
+
+##deaths
+post_tx_deaths <- dead_post_tx - post_tx_re_tx
+
+##alive post-transplant
+alive_post_tx <- recips %>% filter(dead == 0) %>% nrow()
+
+
+##calculate mean follow-up time for censored observations
+last_ob <- to_model %>% 
+  group_by(PX_ID) %>% arrange(t_1) %>% 
+  filter(dead ==0 & row_number() == n()) %>% 
+  select(PX_ID, t_2)
+
+mean_fup_time <- comma_2(mean(last_ob$t_2)/365)
+```
+During 2006-2015, there were `r comma(tot_adults)` adult candidates registered for heart transplantation in the US. After exclusions (**Figure 1**), the remaining eligible `r comma(tot_analyzed)` adult candidates were listed at `r length(unique(to_model$center))` centers and `r comma(tot_tx)` (`r comma_2(100*tot_tx/tot_analyzed)`%) received a heart transplant. Among heart transplant recipients, `r comma(dead_post_tx)` (`r comma_2(100*dead_post_tx/tot_tx)`%) died or were re-transplanted during the study period and `r comma(alive_post_tx)` (`r comma_2(100*alive_post_tx/tot_tx)`%) remained alive at last follow-up. Of the `r comma(tot_analyzed - tot_tx)` candidates who did not receive a transplant, `r comma(died_before_tx)` (`r comma_2(100*died_before_tx/(tot_analyzed - tot_tx))`%) died (`r comma(death_on_list)` while on the waitlist and `r comma(died_delist)` after delisting) and `r comma(still_waiting)` (`r comma_2(100*still_waiting/(tot_analyzed - tot_tx))`%) were alive but had not received a transplant by the end of follow-up. Surviving patients in the cohort were followed for an average of `r mean_fup_time` years before censoring.
+
+## Figure 1: STROBE flow diagram
+![](Figure_1_2018.png)
+
+Study population selection displayed in STrengthening the Reporting of OBservational studies in Epidemiology (STROBE) diagram format. 
+We excluded `r comma(n_mults)` for multi-organ transplantation, `r comma(removed_low_tx)` candidates for listing at one of `r num_low_vol_centers` low volume centers, `r comma(only_inactive)` candidates who were never activated on the list, and `r comma(error_dates)` candidates with obvious data entry.
+
+
+* There were `r comma(tot_adults)` adult heart transplant candidates listed from 2006-2015
+* After applying exclusion criteria, the total number of candidates analyzed was `r comma(tot_analyzed)`
+* There were `r comma(total_exclusions)` Exclusions
+    * multi-organ transplant `r comma(n_mults)`
+    * low-volume center `r comma(removed_low_tx)`
+    * missing data `r comma(miss_data)`
+        * `r comma(only_inactive)` exclusions for candidates who were never activated on the list
+        * `r comma(error_dates)` candidates with obvious date data entry errors
+* A total of `r comma(tot_analyzed - tot_tx)` candidates were not transplanted
+    * `r comma(died_before_tx)` candidates died before transplant
+        * death on waitlist (N= `r comma(death_on_list)`)
+        * died after delisting (N = `r comma(died_delist)`)
+    * `r comma(still_waiting)` candidates did not receive a transplant before the end of follow-up
+* There were `r comma(tot_tx)` total transplants
+    * A total of `r comma(dead_post_tx)` recipients died or were re-transplanted
+        * post-transplant death (N = `r comma(post_tx_deaths)`)
+        * re-transplant(N = `r comma(post_tx_re_tx)`)
+    * The remaining `r comma(alive_post_tx)` recipients remained alive at last follow-up 
+    
+
+# Table 1
+```{r table_1}
+library(tableone)
+
+cand_thor <- read_sas("SAF 2018 Q3/cand_thor.sas7bdat", NULL) %>%  
+  zap_formats() %>% zap_labels()
+
+for_table_one <- to_model %>% 
+  group_by(PX_ID) %>%
+  mutate(tx_mean = mean(tx),
+         got_tx = ifelse(tx_mean> 0, 1, 0)) %>%
+  filter(row_number()==1) %>%
+  ungroup() %>%
+  left_join(cand_thor)
+
+for_table_one <- for_table_one %>%
+  select(
+    CAN_AGE_AT_LISTING,
+    CAN_GENDER,
+    CAN_BMI,
+    CAN_RACE,
+    CAN_DGN,
+    CAN_ABO,
+    CAN_DIAB_TY,
+    CAN_MOST_RECENT_CREAT,
+    CAN_DIAL,
+    CAN_FUNCTN_STAT,
+    CAN_PCW_MEAN,
+    CAN_PULM_ART_MEAN,
+    CAN_CARDIAC_OUTPUT,
+    CAN_WGT_KG,
+    CAN_HGT_CM,
+    CAN_PRIMARY_PAY,
+    stat_just,
+    cf_lvad,
+    got_tx) %>%
+   mutate(Gender = factor(CAN_GENDER, levels = c("F", "M")),
+         Race = factor(CAN_RACE),
+         Race = fct_lump(Race, n = 3),
+        Race = fct_recode(Race,
+                          "White" = "8",
+                          "Black" = "16",
+                          "Hispanic" = "2000", 
+                          "Other" = "Other"),
+        Diagnosis = case_when(
+          CAN_DGN>999 & CAN_DGN<1007 ~ "Dilated cardiomyopathy, non-ischemic",
+          CAN_DGN == 1007 | CAN_DGN ==1200 ~ "Ischemic cardiomyopathy",
+          CAN_DGN>1048 & CAN_DGN< 1100 ~ "Restrictive cardiomyopathy",
+          TRUE ~ "Other"
+        ),
+        Diagnosis = factor(Diagnosis, 
+                           levels = c("Dilated cardiomyopathy, non-ischemic", 
+                                      "Ischemic cardiomyopathy", 
+                                      "Restrictive cardiomyopathy", 
+                                      "Other")),
+        Diabetes = case_when(
+          CAN_DIAB_TY>1 & CAN_DIAB_TY<6 ~ "History of DM",
+          CAN_DIAB_TY ==1 ~ "Non-diabetic",
+          TRUE ~ "Unknown"
+        ),
+        female_gfr = if_else(CAN_GENDER == "F", 0.742, 1),
+        black_gfr = if_else(Race == "Black", 1.21, 1),
+eGFR = 175*((CAN_MOST_RECENT_CREAT)^(-1.154))*(CAN_AGE_AT_LISTING^(-0.203))*female_gfr*black_gfr,
+        Renal_Function = case_when(
+          CAN_DIAL == "Y" ~ "Dialysis",
+          eGFR >= 60 ~ "GFR >= 60 ml/min/1.73 m^2",
+          eGFR>= 30 ~ "GFR >= 30 & <60 ml/min/1.73 m^2",
+          eGFR < 30 ~ "GFR < 30 ml/min/1.73 m^2",
+          TRUE ~ "Unknown"
+        ),
+        Renal_Function = if_else(is.na(Renal_Function)==TRUE, "Unknown", Renal_Function),
+        body_surface_area = 0.007184*(CAN_HGT_CM)^(0.725)*CAN_WGT_KG^(0.425),
+        Cardiac_Index = as.numeric(CAN_CARDIAC_OUTPUT/body_surface_area),
+        Functional_Status = case_when(
+          CAN_FUNCTN_STAT == 1 | (CAN_FUNCTN_STAT>2069) ~"Limited Impairment, 10-30%",
+          (CAN_FUNCTN_STAT>2039 & CAN_FUNCTN_STAT<2061) ~ "Moderate Impairment, 40-60%",
+          (CAN_FUNCTN_STAT>2000 & CAN_FUNCTN_STAT<2031) ~ "Severe Impairment, 70-100%",
+          TRUE ~ "Unknown"
+        ),
+        Functional_Status = ifelse(is.na(Functional_Status), "Unknown", Functional_Status),
+        severe_impairment = ifelse(Functional_Status == "Severe Impairment, 70-100%", 1, 0),
+        acute_mcs = ifelse(stat_just == "Status 1A (MCS for shock)", 1, 0),
+        lvad_comp = ifelse(stat_just == "Status 1A (MCS complication)", 1, 0),
+        pcwp_15 = ifelse(CAN_PCW_MEAN < 15, 1, 0),
+        pcwp_15 = ifelse(is.na(CAN_PCW_MEAN), 0, pcwp_15),
+         blood_type = factor(
+           case_when(
+             CAN_ABO %in% c("A", "A1", "A2") ~ "A",
+             CAN_ABO %in% c("A1B", "A2B") ~ "AB",
+             TRUE ~ CAN_ABO)
+           ),
+        payor = case_when(
+          CAN_PRIMARY_PAY %in% c(3,4,13) ~ "Medicare",
+          CAN_PRIMARY_PAY ==2 ~ "Medicaid",
+          CAN_PRIMARY_PAY == 1 ~ "Private",
+          TRUE ~ "Other"
+        )
+  )
+
+library(tableone)
+cont_vars <- c("CAN_AGE_AT_LISTING", "CAN_BMI", 
+               "CAN_PULM_ART_MEAN", "CAN_PCW_MEAN", "Cardiac_Index")
+
+cat_vars <- c( "stat_just", "cf_lvad", 
+               "Gender","Race", 
+               "Diagnosis", "Diabetes", "Renal_Function", 
+               "Functional_Status","severe_impairment", 
+               "acute_mcs", "lvad_comp", "pcwp_15", "blood_type", "payor")
+
+
+
+CreateTableOne(vars=cont_vars, data = for_table_one, strata = "got_tx")
+
+cat_vars_by_tx <- print(CreateCatTable(vars = cat_vars, data = for_table_one, strata = "got_tx"))
+write.csv(cat_vars_by_tx, "cat_vars_by_tx.csv")
+
+
+cont_vars_by_tx <- print(CreateContTable(vars = cont_vars, data = for_table_one, strata = "got_tx"))
+write.csv(cont_vars_by_tx, "cont_vars_by_tx.csv")
+
+
+
+cat_vars_ <- print(CreateCatTable(vars = cat_vars, data = for_table_one))
+write.csv(cat_vars_, "cat_vars_.csv")
+
+
+cont_vars_ <- print(CreateContTable(vars = cont_vars, data = for_table_one))
+write.csv(cont_vars_, "cont_vars_.csv")
+```
+
+
+
+
